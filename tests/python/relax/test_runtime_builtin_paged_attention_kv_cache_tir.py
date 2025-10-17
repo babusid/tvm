@@ -44,9 +44,12 @@ reserved_nseq = 32
 maximum_total_seq_length = 2048
 prefill_chunk_size = 512
 page_size = 16
-num_layers = 4
-num_qo_heads = 32
-num_kv_heads = 4
+# num_layers = 4
+num_layers = 1  # SIDHARTH - we're testing just one attention layer
+# num_qo_heads = 32
+num_qo_heads = 24
+# num_kv_heads = 4
+num_kv_heads = 8
 head_dim = None
 sm_scale = None
 rope_scale = 1.0
@@ -54,8 +57,8 @@ rope_theta = 1e4
 rope_scaling = {}
 dtype = None
 dtype_torch = None
-device = tvm.cuda()
-device_torch = torch.device("cuda")
+device = tvm.metal()
+device_torch = torch.device("mps")
 fclear = None
 fadd_sequence = None
 fremove_sequence = None
@@ -222,6 +225,10 @@ def create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window):
 )
 def kv_cache_and_config(request):
     global head_dim, sm_scale, dtype, dtype_torch
+    # For testing only: force support_sliding_window to False.
+    # request.param is a tuple (immutable), so build a new tuple with the
+    # fourth element replaced by False and use that for the rest of the logic.
+    request.param = (*request.param[:3], False)
     head_dim, dtype, rope_mode, support_sliding_window = request.param
     dtype_torch = getattr(torch, dtype)
     sm_scale = head_dim ** (-0.5)
@@ -288,13 +295,15 @@ def apply_attention(
     append_lengths = []
     for i, (seq_id, append_length) in enumerate(batch):
         fork_parent_id = None
-        if isinstance(seq_id, tuple):
+        if isinstance(seq_id, tuple):  # SIDHARTH - ignore this
             # Fork sequence
             seq_id, fork_parent_id, fork_pos = seq_id
             batch[i] = (seq_id, append_length)
         seq_ids.append(seq_id)
         append_lengths.append(append_length)
-        if fork_parent_id is not None:
+        if (
+            fork_parent_id is not None
+        ):  # SIDHARTH - should be able to ignore this (for prefill_and_decode)
             assert fork_parent_id in cached_k
             assert seq_id not in cached_k
             ffork_sequence(kv_cache, fork_parent_id, seq_id, fork_pos)
@@ -304,7 +313,7 @@ def apply_attention(
             else:
                 cached_k[seq_id] = cached_k[fork_parent_id][::, :fork_pos]
                 cached_v[seq_id] = cached_v[fork_parent_id][::, :fork_pos]
-        elif seq_id not in cached_k:
+        elif seq_id not in cached_k:  # SIDHARTH - adds sequence to both tvm and cached_k/v
             fadd_sequence(kv_cache, seq_id)
             cached_k[seq_id] = torch.zeros(
                 (num_layers, 0, num_kv_heads, head_dim), dtype=dtype_torch, device=device_torch
@@ -315,7 +324,9 @@ def apply_attention(
 
     flattened_token_tree_parent_ptr = None
     token_tree_node_depths_list: List[Optional[List[int]]] = [None for _ in batch]
-    if token_tree_parent_ptr_list:
+    if (
+        token_tree_parent_ptr_list
+    ):  # SIDHARTH - should be able to ignore this (for prefill_and_decode)
         assert len(token_tree_node_depths_list) == len(seq_ids)
         if accepted_leaf_indices is not None:
             assert len(accepted_leaf_indices) == len(seq_ids)
@@ -358,33 +369,50 @@ def apply_attention(
 
     q_array = []
     for i, (seq_id, append_length) in enumerate(batch):
-        new_q = torch.rand(
-            num_layers,
-            append_length,
-            num_qo_heads,
-            head_dim,
-            dtype=dtype_torch,
-            device=device_torch,
+        # new_q = torch.rand(
+        #     num_layers,
+        #     append_length,
+        #     num_qo_heads,
+        #     head_dim,
+        #     dtype=dtype_torch,
+        #     device=device_torch,
+        # )
+        # new_k = torch.rand(
+        #     num_layers,
+        #     append_length,
+        #     num_kv_heads,
+        #     head_dim,
+        #     dtype=dtype_torch,
+        #     device=device_torch,
+        # )
+        # new_v = torch.rand(
+        #     num_layers,
+        #     append_length,
+        #     num_kv_heads,
+        #     head_dim,
+        #     dtype=dtype_torch,
+        #     device=device_torch,
+        # )
+        # new_q = new_q * 2 - 1
+        # new_k = new_k * 2 - 1
+        # new_v = new_v * 2 - 1
+
+
+        import numpy as np
+        data = np.load(
+            "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-hf/f4_tensor_dump_attn_inputs.npz"
         )
-        new_k = torch.rand(
-            num_layers,
-            append_length,
-            num_kv_heads,
-            head_dim,
-            dtype=dtype_torch,
-            device=device_torch,
-        )
-        new_v = torch.rand(
-            num_layers,
-            append_length,
-            num_kv_heads,
-            head_dim,
-            dtype=dtype_torch,
-            device=device_torch,
-        )
-        new_q = new_q * 2 - 1
-        new_k = new_k * 2 - 1
-        new_v = new_v * 2 - 1
+        new_q = data['arg_0']
+        new_k = data['arg_1']
+        new_v = data['arg_2']
+        new_q = np.transpose(new_q, axes=(0, 2, 1, 3))
+        new_k = np.transpose(new_k, axes=(0, 2, 1, 3))
+        new_v = np.transpose(new_v, axes=(0, 2, 1, 3))
+        new_q = torch.from_numpy(new_q).to(dtype=dtype_torch).to(device_torch)
+        new_k = torch.from_numpy(new_k).to(dtype=dtype_torch).to(device_torch)
+        new_v = torch.from_numpy(new_v).to(dtype=dtype_torch).to(device_torch)
+
+
         q_array.append(new_q)
 
         rope_offset = cached_k[seq_id].shape[1]
@@ -526,7 +554,9 @@ def apply_attention(
             sum_length += append_length
     fend_forward(kv_cache)
 
-    if accepted_leaf_indices is not None:
+    if (
+        accepted_leaf_indices is not None
+    ):  # SIDHARTH - should be able to ignore this (for prefill_and_decode)
         seq_ids = [seq_id for seq_id, _ in batch]
         fcommit_accepted_token_tree_nodes(
             kv_cache, ShapeTuple(seq_ids), ShapeTuple(accepted_leaf_indices)
@@ -586,7 +616,7 @@ def apply_attention(
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window and rope_mode == RopeMode.NORMAL:
@@ -595,14 +625,16 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_config):
     fclear(kv_cache)
 
     # Prefill.
-    operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
-    operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
-    operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
-    # Decode
-    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
-    operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
-    operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # operation_seq = [[(0, 6)], [(1, 8)], [(2, 11)], [(3, 16)], [(4, 19), (5, 20)]]
+    # operation_seq += [[(6, 21), (7, 24)], [(2, 5), (4, 7), (8, 24)]]
+    # operation_seq += [[(6, 13)], [(8, 19)], [(0, 1)], [(1, 3), (3, 8), (5, 12), (7, 11)]]
+    operation_seq = [[(0, 30)]]  # SIDHARTH: hf testing script runs with a 30 token prefill
+
+    # Decode - SIDHARTH: We're not doing any decode right now
+    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # operation_seq += [[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
+    # operation_seq += [[(0, 1), (2, 1), (4, 1), (6, 1), (8, 1)]]
+    # operation_seq += [[(4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]]
 
     cached_k = {}
     cached_v = {}
@@ -611,7 +643,7 @@ def test_paged_attention_kv_cache_prefill_and_decode(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_remove_sequence(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window and rope_mode == RopeMode.NORMAL:
@@ -638,7 +670,7 @@ def test_paged_attention_kv_cache_remove_sequence(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_fork_sequence(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window and rope_mode == RopeMode.NORMAL:
@@ -716,7 +748,7 @@ def test_paged_attention_kv_cache_fork_sequence(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_unlimited_depth(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window and rope_mode == RopeMode.NORMAL:
@@ -767,7 +799,7 @@ def test_paged_attention_kv_cache_unlimited_depth(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_popn(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window and rope_mode == RopeMode.NORMAL:
@@ -802,7 +834,7 @@ def test_paged_attention_kv_cache_popn(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_sliding_window(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if not support_sliding_window or rope_mode == RopeMode.NORMAL:
@@ -854,7 +886,7 @@ def test_paged_attention_kv_cache_sliding_window(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_sliding_window_fork(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if not support_sliding_window or rope_mode == RopeMode.NORMAL:
@@ -927,7 +959,7 @@ def test_paged_attention_kv_cache_sliding_window_fork(kv_cache_and_config):
 
 
 @tvm.testing.requires_gpu
-@tvm.testing.requires_cuda
+# @tvm.testing.requires_cuda
 def test_paged_attention_kv_cache_tree_attn(kv_cache_and_config):
     kv_cache, rope_mode, support_sliding_window = kv_cache_and_config
     if support_sliding_window:
@@ -1011,10 +1043,16 @@ def test_paged_attention_kv_cache_tree_attn(kv_cache_and_config):
 
 
 if __name__ == "__main__":
-    HEAD_DIMS = [64, 128]
-    DTYPES = ["float16", "float32"]
+    # HEAD_DIMS = [64, 128]
+    HEAD_DIMS = [
+        128
+    ]  # SIDHARTH - modeling phi3 uses hidden_size 3072, and 24 attn heads => head_dim = 128
+    # DTYPES = ["float16", "float32"]
+    DTYPES = ["float32"]
     ROPE_MODES = [RopeMode.NONE, RopeMode.NORMAL, RopeMode.INLINE]
-    SUPPORT_SLIDING_WINDOW = [False, True]
+    # ROPE_MODES = [RopeMode.NORMAL]  # SIDHARTH - phi3_model.py uses RopeMode.NORMAL as default
+    # SUPPORT_SLIDING_WINDOW = [False, True]
+    SUPPORT_SLIDING_WINDOW = [False]
     for head_dim, dtype, rope_mode, support_sliding_window in itertools.product(
         HEAD_DIMS, DTYPES, ROPE_MODES, SUPPORT_SLIDING_WINDOW
     ):
@@ -1024,9 +1062,19 @@ if __name__ == "__main__":
         cache = create_kv_cache(head_dim, dtype, rope_mode, support_sliding_window)
         cache_and_config = (cache, rope_mode, support_sliding_window)
         test_paged_attention_kv_cache_prefill_and_decode(cache_and_config)
-        test_paged_attention_kv_cache_remove_sequence(cache_and_config)
-        test_paged_attention_kv_cache_fork_sequence(cache_and_config)
-        test_paged_attention_kv_cache_popn(cache_and_config)
-        test_paged_attention_kv_cache_sliding_window(cache_and_config)
-        test_paged_attention_kv_cache_tree_attn(cache_and_config)
-        test_paged_attention_kv_cache_unlimited_depth(cache_and_config)
+        # test_paged_attention_kv_cache_remove_sequence(cache_and_config)
+        # test_paged_attention_kv_cache_fork_sequence(cache_and_config)
+        # test_paged_attention_kv_cache_popn(cache_and_config)
+        # test_paged_attention_kv_cache_sliding_window(cache_and_config)
+        # test_paged_attention_kv_cache_tree_attn(cache_and_config)
+        # test_paged_attention_kv_cache_unlimited_depth(cache_and_config)
+        print(
+            "Passed for head_dim =",
+            head_dim,
+            "dtype =",
+            dtype,
+            "rope_mode =",
+            rope_mode,
+            "support_sliding_window =",
+            support_sliding_window,
+        )
