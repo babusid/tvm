@@ -459,6 +459,14 @@ def apply_attention(
         qkv = tvm.runtime.tensor(
             torch.cat([queries_np, keys_np, values_np], dim=1).cpu().numpy(), device
         )
+
+        # OVERLOAD QKV TENSOR
+        data = np.load(
+            "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-q0f32/prefill/f3_vm.builtin.attention_kv_cache_attention_with_fused_qkv.npz"
+        )
+        qkv = data['arg_3']
+        qkv = tvm.runtime.tensor(qkv, device)
+
         outputs = tvm.runtime.empty(queries_np.shape, dtype, device=device)
         fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
 
