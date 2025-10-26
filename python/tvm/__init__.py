@@ -108,3 +108,17 @@ def tvm_wrap_excepthook(exception_hook):
 
 
 sys.excepthook = tvm_wrap_excepthook(sys.excepthook)
+
+
+MY_TENSOR_DUMP_COUNTER = 0
+@register_global_func("print_tensor")
+def print_tensor(tensor, description: str):
+    """Print the tensor with its name."""
+    import numpy as np
+    global MY_TENSOR_DUMP_COUNTER
+    np.savez(
+        f"/Users/sidhartb/Work/mlc-llm/dist/debug/debug-chat-intermediates/"
+        f"{MY_TENSOR_DUMP_COUNTER}_tensor_dump_{description}.npz",
+        arg_0=tensor.numpy(),
+    )
+    MY_TENSOR_DUMP_COUNTER += 1

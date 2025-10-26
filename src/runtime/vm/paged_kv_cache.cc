@@ -1335,6 +1335,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       f_split_rotary_(qkv_data_view, q_rope_position_map_view_, q_data, k_data, v_data,
                       rope_ext_factors_.value());
     }
+    ffi::Function printTensor = ffi::Function::GetGlobalRequired("print_tensor");
+    printTensor(q_data, "q_split_rotary");
+    printTensor(k_data, "k_split_rotary");
+    printTensor(v_data, "v_split_rotary");
 
     // Part 3. Append k/v data to kv-cache if flag "append_before_attn" is set.
     CHECK(f_transpose_append_mha_.defined());

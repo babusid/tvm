@@ -399,19 +399,41 @@ def apply_attention(
 
 
         import numpy as np
+        # data = np.load(
+        #     "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-hf/f4_tensor_dump_attn_inputs.npz"
+        # )
+        # new_q = data['arg_0']
+        # new_k = data['arg_1']
+        # new_v = data['arg_2']
+        # new_q = np.transpose(new_q, axes=(0, 2, 1, 3))
+        # new_k = np.transpose(new_k, axes=(0, 2, 1, 3))
+        # new_v = np.transpose(new_v, axes=(0, 2, 1, 3))
+        # new_q = torch.from_numpy(new_q).to(dtype=dtype_torch).to(device_torch)
+        # new_k = torch.from_numpy(new_k).to(dtype=dtype_torch).to(device_torch)
+        # new_v = torch.from_numpy(new_v).to(dtype=dtype_torch).to(device_torch)
+
+        #  OVERLOAD QKV TENSOR DIRECTLY from MLC dump
         data = np.load(
-            "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-hf/f4_tensor_dump_attn_inputs.npz"
+            "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-q0f32/prefill/f3_vm.builtin.attention_kv_cache_attention_with_fused_qkv.npz"
         )
-        new_q = data['arg_0']
-        new_k = data['arg_1']
-        new_v = data['arg_2']
-        new_q = np.transpose(new_q, axes=(0, 2, 1, 3))
-        new_k = np.transpose(new_k, axes=(0, 2, 1, 3))
-        new_v = np.transpose(new_v, axes=(0, 2, 1, 3))
+        _loaded_qkv = data['arg_3']
+        _loaded_attn = data['arg_4']
+
+        # get first (1, 30,24,128) into new_q, keep the batch dimension (24 attn heads)
+        new_q = _loaded_qkv[:, :24, :]
+        new_q = np.expand_dims(new_q, axis=0)
+
+        # get next (1, 30, 8, 128) into new_k (8 kv heads)
+        new_k = _loaded_qkv[:, 24:32, :]
+        new_k = np.expand_dims(new_k, axis=0)
+
+        # get last (1, 30, 8, 128) into new_v (8 kv heads)
+        new_v = _loaded_qkv[:, 32:40, :]
+        new_v = np.expand_dims(new_v, axis=0)
+
         new_q = torch.from_numpy(new_q).to(dtype=dtype_torch).to(device_torch)
         new_k = torch.from_numpy(new_k).to(dtype=dtype_torch).to(device_torch)
         new_v = torch.from_numpy(new_v).to(dtype=dtype_torch).to(device_torch)
-
 
         q_array.append(new_q)
 
@@ -456,16 +478,12 @@ def apply_attention(
         queries_np = global_new_q[layer_id]
         keys_np = global_new_k[layer_id]
         values_np = global_new_v[layer_id]
+        qkv = torch.cat([queries_np, keys_np, values_np], dim=1).cpu().numpy()
         qkv = tvm.runtime.tensor(
-            torch.cat([queries_np, keys_np, values_np], dim=1).cpu().numpy(), device
+            qkv, device
         )
 
-        # OVERLOAD QKV TENSOR DIRECTLY
-        # data = np.load(
-        #     "/Users/sidhartb/Work/mlc-llm/dist/debug/debug-Phi-4-mini-instruct-q0f32/prefill/f3_vm.builtin.attention_kv_cache_attention_with_fused_qkv.npz"
-        # )
-        # qkv = data['arg_3']
-        # qkv = tvm.runtime.tensor(qkv, device)
+
 
         outputs = tvm.runtime.empty(queries_np.shape, dtype, device=device)
         fattention_with_fuse_qkv(kv_cache, layer_id, sm_scale, qkv, outputs)
