@@ -1273,6 +1273,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
   void AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data, ffi::Optional<Tensor> mask,
                              Tensor o_data, double sm_scale) final {
+    ffi::Function printTensor = ffi::Function::GetGlobalRequired("print_tensor");
+    printTensor(qkv_data, "qkv_data_at_input");
+    printTensor(o_data, "o_data_at_input");
+
     // Part 1. Shape and dtype check.
     int64_t local_layer_id = layer_id - layer_id_begin_offset_;
     CHECK_GE(local_layer_id, 0);
@@ -1328,6 +1332,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       // The the compute stream needs to wait for the KV transfer stream.
       DeviceAPI::Get(device_)->SyncStreamFromTo(device_, kv_transfer_stream_, compute_stream_);
     }
+    printTensor(qkv_data_view, "qkv_data_view_before_split_rotary");
     if (!rope_ext_factors_.defined()) {
       f_split_rotary_(qkv_data_view, q_rope_position_map_view_, q_data, k_data, v_data,
                       static_cast<int>(rope_mode_ == RoPEMode::kNormal));
@@ -1335,7 +1340,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       f_split_rotary_(qkv_data_view, q_rope_position_map_view_, q_data, k_data, v_data,
                       rope_ext_factors_.value());
     }
-    ffi::Function printTensor = ffi::Function::GetGlobalRequired("print_tensor");
     printTensor(q_data, "q_split_rotary");
     printTensor(k_data, "k_split_rotary");
     printTensor(v_data, "v_split_rotary");
