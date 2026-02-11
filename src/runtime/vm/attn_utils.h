@@ -63,6 +63,7 @@ enum class AttnKind : int {
   kMLA = 1,
   kLinearAttn = 2,
   kMHASliding = 3,
+  kGatedDeltaNet = 4,
 };
 
 /*! \brief Given the attention kind and other metadata, return the one-layer KV cache shape. */

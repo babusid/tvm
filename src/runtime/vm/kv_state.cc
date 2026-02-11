@@ -81,6 +81,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              kv_cache->AttentionWithFusedQKV(layer_id, std::move(qkv_data), std::nullopt,
                                              std::move(o_data), sm_scale);
            })
+      .def("vm.builtin.attention_kv_cache_gated_deltanet_attention",
+           [](AttentionKVCache kv_cache, int64_t layer_id, double sm_scale, 
+             Tensor input_qk, Tensor input_vz,
+             Tensor input_ba, Tensor o_data) {
+             kv_cache->GatedDeltaNetAttention(layer_id, std::move(input_qk), std::move(input_vz), 
+                 std::move(input_ba), std::nullopt, std::move(o_data), sm_scale);
+           })
       .def("vm.builtin.attention_kv_cache_self_attention",
            [](AttentionKVCache kv_cache, int64_t layer_id, double sm_scale, Tensor q_data,
               Tensor k_data, Tensor v_data, Tensor o_data, Tensor lse_data) {
