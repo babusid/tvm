@@ -181,9 +181,16 @@ class AttentionKVCacheObj : public KVStateObj {
    * \sa AttentionKVCache::Attention
    */
   virtual void GatedDeltaNetAttention(
-      int64_t layer_id, Tensor input_qk, Tensor input_vz, Tensor input_ba, 
-      ffi::Optional<Tensor> mask, Tensor o_data, double sm_scale
-      ) = 0;
+      int64_t layer_id, 
+      Tensor input_qkvz, 
+      Tensor input_ba, 
+      int linear_key_head_dim, 
+      int linear_num_key_heads,
+      int linear_value_head_dim, 
+      int linear_num_value_heads, 
+      ffi::Optional<Tensor> mask, 
+      Tensor o_data, 
+      double sm_scale) = 0;
 
 
   /*!
