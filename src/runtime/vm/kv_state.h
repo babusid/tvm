@@ -180,19 +180,7 @@ class AttentionKVCacheObj : public KVStateObj {
    * \param sm_scale The additional attention scaling factor.
    * \sa AttentionKVCache::Attention
    */
-  virtual void GatedDeltaNetAttention(
-      int64_t layer_id, 
-      Tensor input_qkvz, 
-      Tensor input_ba, 
-      int linear_key_head_dim, 
-      int linear_num_key_heads,
-      int linear_value_head_dim, 
-      int linear_num_value_heads, 
-      ffi::Optional<Tensor> mask, 
-      Tensor o_data, 
-      double sm_scale) = 0;
-
-
+  //TODO: Implement header binding for deltanet methods here once implementation is stable 
   /*!
    * \brief Compute attention with Q/K/V data which are concatenated along
    * the head dimension.

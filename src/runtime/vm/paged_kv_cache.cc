@@ -1278,50 +1278,56 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                  sequence->kv_transfer_metadata.local_position_map.end());
   }
 
-  void GatedDeltaNetAttention(int64_t layer_id, Tensor input_qkvz, Tensor input_ba,
-                              int linear_key_head_dim,     // TODO: migrate this to a class field
-                              int linear_num_key_heads,    // TODO: migrate this to a class field
-                              int linear_value_head_dim,   // TODO: migrate this to a class field
-                              int linear_num_value_heads,  // TODO: migrate this to a class field
-                              ffi::Optional<Tensor> mask, Tensor o_data, double sm_scale) final {
-    // qkvz:   [batch, seq_len, linear_key_head_dim*linear_num_key_heads*2 + linear_value_head_dim *
-    // linear_num_value_heads*2] 
-    // ba:     [batch, seq_len, linear_num_value_heads*2] o_data: [batch,
-    // seq_len, linear_num_value_heads * linear_value_head_dim ]
+  void chunk_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor gamma, Tensor beta,
+                              int chunk_size, Tensor initial_state, bool output_final_state,
+                              bool use_qk_l2norm_in_kernel
+                              int num_linear_value_heads, //TODO: move to class field
+                              int num_linear_key_heads, //TODO: move to class field
+                              int linear_value_head_dim, //TODO: move to class field
+                              int linear_key_head_dim //TODO: move to class field
+                              ) {
+    // Part 1. check input data
     
-    //  Part 1. Shape and dtype check.
-    int linear_key_dim = linear_key_head_dim * linear_num_key_heads;
-    int linear_value_dim = linear_value_head_dim * linear_num_value_heads;
-   
-    int64_t local_layer_id = layer_id - layer_id_begin_offset_;
-    CHECK_GE(local_layer_id, 0);
-    CHECK_LT(local_layer_id, num_layers_);
-
-    Tensor pages = pages_[local_layer_id];
-    CHECK(input_qkvz.DataType() == pages.DataType());
-    CHECK(input_ba.DataType() == pages.DataType());
-    CHECK(o_data.DataType() == pages.DataType());
-    CHECK(attn_kinds_[layer_id] == AttnKind::kGatedDeltaNet);
-    CHECK_EQ(input_qkvz->ndim, 3);
-    CHECK_EQ(input_ba->ndim, 3);
-    CHECK_EQ(o_data->ndim, 3);
-
-    for (int dim = 0; dim < 3; ++dim) {
-      if (dim == 2) {
-        CHECK_EQ(input_qkvz->shape[dim], linear_key_dim * 2 + linear_value_dim * 2);
-        CHECK_EQ(input_ba->shape[dim], linear_num_value_heads * 2);
-        CHECK_EQ(o_data->shape[dim], linear_value_dim);
+    //check dims
+    CHECK_EQ(query->ndim, 4);
+    CHECK_EQ(key->ndim, 4);
+    CHECK_EQ(value->ndim, 4);
+    CHECK_EQ(gamma->ndim, 3);
+    CHECK_EQ(beta->ndim, 3);
+    
+    for (size_t i = 0; i < 4; ++i) {
+      //check q,k,v tensors
+      if(i==3){
+        CHECK_EQ(query->shape[i],linear_key_head_dim);
+        CHECK_EQ(key->shape[i], linear_key_head_dim);
+        CHECK_EQ(value->shape[i], linear_value_head_dim);
+      } else if (i==2) {
+        CHECK_EQ(query->shape[i], num_linear_value_heads);
+        CHECK_EQ(key->shape[i], num_linear_value_heads);
+        CHECK_EQ(value->shape[i], num_linear_value_heads);
       } else {
-        CHECK_EQ(input_qkvz->shape[dim], input_ba->shape[dim]);
-        CHECK_EQ(input_qkvz->shape[dim], o_data->shape[dim]);
+        CHECK_EQ(query->shape[i], key->shape[i]);
+        CHECK_EQ(query->shape[i], value->shape[i]);
       }
     }
 
+    //check gamma and beta Tensors
+    for (size_t i = 0; i < 3; ++i) {
+      CHECK_EQ(gamma->shape[i], beta->shape[i]);
+    }
+    CHECK_EQ(gamma->shape[2], num_linear_value_heads);
 
-    // Gated Delta Net Attention from Qwen3-next models
-    // TODO: Implement Gated Delta Net attn here.
+  
+
     return;
   }
+
+  void recurrent_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor gamma, Tensor beta,
+                                  Tensor initial_state, bool output_final_state,
+                                  bool use_qk_l2norm_in_kernel){
+    return;
+  }
+
 
   void AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data, ffi::Optional<Tensor> mask,
                              Tensor o_data, double sm_scale) final {
