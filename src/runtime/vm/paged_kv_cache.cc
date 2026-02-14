@@ -29,7 +29,6 @@
 #include <tvm/runtime/tensor.h>
 
 #include <algorithm>
-#include <cstdint>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
@@ -116,15 +115,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
   /*! \brief The KV cache dtype. */
   const DataType kv_dtype_;
-  
-  /*! \brief Linear attention configuration fields for GatedDeltaNet layers. */
-  const int64_t linear_conv_kernel_dim_;
-  const int64_t num_linear_value_heads_;
-  const int64_t num_linear_key_heads_;
-  const int64_t linear_value_head_dim_;
-  const int64_t linear_key_head_dim_;
-  const int64_t reserved_num_seqs_;
-  
   /*! \brief We fix int32 to be the index dtype of auxiliary data. */
   const DLDataType dtype_aux_ = DLDataType(DataType::Int(32, 1));
 
@@ -138,12 +128,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
    * has layout (num_pages, 2, num_heads, page_size, qk_head_dim).
    * Along on the "2" dimension, index 0 stands for K and 1 stands for V.
    */
-
-  // for gated deltanet attn
-  std::vector<Tensor> conv_states_;
-  std::vector<Tensor> recurrent_states_;
-  
-  // for regular attn
   std::vector<Tensor> pages_;
   /*! \brief The whole KV cache allocated by NVSHMEM*/
   Tensor nvshmem_pages_;
@@ -299,13 +283,11 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   explicit PagedAttentionKVCacheObj(
       int64_t page_size, int64_t num_layers, int64_t layer_id_begin_offset,
       int64_t layer_id_end_offset, int64_t num_qo_heads, int64_t num_kv_heads, int64_t qk_head_dim,
-      int64_t v_head_dim, std::vector<AttnKind> attn_kinds, int64_t num_total_pages,
-      int64_t prefill_chunk_size, bool support_sliding_window,
+      int64_t v_head_dim, std::vector<AttnKind> attn_kinds, int64_t reserved_num_seqs,
+      int64_t num_total_pages, int64_t prefill_chunk_size, bool support_sliding_window,
       RoPEMode rope_mode, double rotary_scale, double rotary_theta,
-      ffi::Optional<Tensor> rope_ext_factors, bool enable_kv_transfer, DLDataType dtype, Device device,
-      int64_t linear_conv_kernel_dim, int64_t num_linear_value_heads, int64_t num_linear_key_heads,
-      int64_t linear_value_head_dim, int64_t linear_key_head_dim, int64_t reserved_num_seqs,
-      ffi::Optional<ffi::Function> f_transpose_append_mha,
+      ffi::Optional<Tensor> rope_ext_factors, bool enable_kv_transfer, DLDataType dtype,
+      Device device, ffi::Optional<ffi::Function> f_transpose_append_mha,
       ffi::Optional<ffi::Function> f_transpose_append_mla, ffi::Function f_compact_copy,
       std::unique_ptr<RaggedPrefillFunc> f_attention_prefill_ragged,
       std::unique_ptr<PagedPrefillFunc> f_attention_prefill,
@@ -339,12 +321,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         rotary_theta_(rotary_theta),
         rope_ext_factors_(std::move(rope_ext_factors)),
         kv_dtype_(DataType(dtype)),
-        linear_conv_kernel_dim_(linear_conv_kernel_dim),
-        num_linear_value_heads_(num_linear_value_heads),
-        num_linear_key_heads_(num_linear_key_heads),
-        linear_value_head_dim_(linear_value_head_dim),
-        linear_key_head_dim_(linear_key_head_dim),
-        reserved_num_seqs_(reserved_num_seqs),
         f_transpose_append_mha_(std::move(f_transpose_append_mha)),
         f_transpose_append_mla_(std::move(f_transpose_append_mla)),
         f_compact_copy_(std::move(f_compact_copy)),
@@ -366,40 +342,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     if (std::find(attn_kinds_.begin(), attn_kinds_.end(), AttnKind::kMLA) != attn_kinds_.end()) {
       TVM_FFI_ICHECK(!support_sliding_window_) << "Sliding window not supported yet for MLA";
       TVM_FFI_ICHECK(!enable_kv_transfer) << "KV transfer not supported yet for MLA";
-    }
-    // Note: For deltanet, sliding window and disaggregation are disabled for now. TODO: do we need
-    // this?
-    if (std::find(attn_kinds_.begin(), attn_kinds_.end(), AttnKind::kGatedDeltaNet) !=
-        attn_kinds_.end()) {
-      CHECK(!support_sliding_window_) << "Sliding window not supported yet for MLA";
-      CHECK(!enable_kv_transfer) << "KV transfer not supported yet for MLA";
-    }
-
-    for (size_t i = 0; i < attn_kinds_.size(); ++i) {
-      // for each one where it is kGatedDeltaNet, allocate a conv states
-      int64_t conv_dim = linear_key_head_dim_ * linear_num_key_heads_ * 2 +
-                         linear_value_head_dim_ * linear_num_value_heads_;
-      if (attn_kinds_[i] != AttnKind::kGatedDeltaNet) {
-        // empty tensor so that indexing is easy
-        conv_states_.push_back(Tensor());
-        recurrent_states_.push_back(Tensor());
-      } else {
-        // conv_state is (batch_size, conv_dim, linear_conv_kernel_dim - 1)
-        // conv_dim is linear_key_head_dim * linear_num_key_heads * 2 + linear_value_head_dim *
-        // linear_num_value_heads
-        conv_states_.push_back(Tensor::Empty(
-              {reserved_num_seqs_, conv_dim, linear_conv_kernel_dim_ - 1},
-              dtype,
-              device
-        ));
-
-        // recurrent state is (batch_size, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim)
-        recurrent_states_.push_back(Tensor::Empty(
-              {reserved_num_seqs_, linear_num_value_heads_, linear_key_head_dim_, linear_value_head_dim_},
-              dtype,
-              device
-        ));
-      }
     }
 
     pages_.reserve(num_layers);
@@ -1336,57 +1278,56 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                  sequence->kv_transfer_metadata.local_position_map.end());
   }
 
-  void chunk_gated_delta_rule(
-      int64_t layer_id, Tensor query, Tensor key, Tensor value, Tensor gamma, Tensor beta,
-      int chunk_size, Tensor initial_state, bool output_final_state,
-      bool use_qk_l2norm_in_kernel int num_linear_value_heads,  // TODO: move to class field
-      int num_linear_key_heads,                                 // TODO: move to class field
-      int linear_value_head_dim,                                // TODO: move to class field
-      int linear_key_head_dim                                   // TODO: move to class field
-  ) {
+  void chunk_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor gamma, Tensor beta,
+                              int chunk_size, Tensor initial_state, bool output_final_state,
+                              bool use_qk_l2norm_in_kernel
+                              int num_linear_value_heads, //TODO: move to class field
+                              int num_linear_key_heads, //TODO: move to class field
+                              int linear_value_head_dim, //TODO: move to class field
+                              int linear_key_head_dim //TODO: move to class field
+                              ) {
     // Part 1. check input data
-    int64_t local_layer_id = layer_id - layer_id_begin_offset_;
-    CHECK_GE(local_layer_id, 0);
-    CHECK_LT(local_layer_id, num_layers_);
-    Tensor conv_state = conv_states_[local_layer_id];
-
-    // check dims
+    
+    //check dims
     CHECK_EQ(query->ndim, 4);
     CHECK_EQ(key->ndim, 4);
     CHECK_EQ(value->ndim, 4);
     CHECK_EQ(gamma->ndim, 3);
     CHECK_EQ(beta->ndim, 3);
-
+    
     for (size_t i = 0; i < 4; ++i) {
-      // check q,k,v tensors
-      if (i == 3) {
-        CHECK_EQ(query->shape[i], linear_key_head_dim_);
-        CHECK_EQ(key->shape[i], linear_key_head_dim_);
-        CHECK_EQ(value->shape[i], linear_value_head_dim_);
-      } else if (i == 2) {
-        CHECK_EQ(query->shape[i], num_linear_value_heads_);
-        CHECK_EQ(key->shape[i], num_linear_value_heads_);
-        CHECK_EQ(value->shape[i], num_linear_value_heads_);
+      //check q,k,v tensors
+      if(i==3){
+        CHECK_EQ(query->shape[i],linear_key_head_dim);
+        CHECK_EQ(key->shape[i], linear_key_head_dim);
+        CHECK_EQ(value->shape[i], linear_value_head_dim);
+      } else if (i==2) {
+        CHECK_EQ(query->shape[i], num_linear_value_heads);
+        CHECK_EQ(key->shape[i], num_linear_value_heads);
+        CHECK_EQ(value->shape[i], num_linear_value_heads);
       } else {
         CHECK_EQ(query->shape[i], key->shape[i]);
         CHECK_EQ(query->shape[i], value->shape[i]);
       }
     }
 
-    // check gamma and beta Tensors
+    //check gamma and beta Tensors
     for (size_t i = 0; i < 3; ++i) {
       CHECK_EQ(gamma->shape[i], beta->shape[i]);
     }
-    CHECK_EQ(gamma->shape[2], num_linear_value_heads_);
+    CHECK_EQ(gamma->shape[2], num_linear_value_heads);
+
+  
 
     return;
   }
 
   void recurrent_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor gamma, Tensor beta,
                                   Tensor initial_state, bool output_final_state,
-                                  bool use_qk_l2norm_in_kernel) {
+                                  bool use_qk_l2norm_in_kernel){
     return;
   }
+
 
   void AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data, ffi::Optional<Tensor> mask,
                              Tensor o_data, double sm_scale) final {
