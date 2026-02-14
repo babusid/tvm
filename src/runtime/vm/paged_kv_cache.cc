@@ -1278,48 +1278,27 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                  sequence->kv_transfer_metadata.local_position_map.end());
   }
 
-  void GatedDeltaNetAttention(int64_t layer_id, Tensor input_qkvz, Tensor input_ba,
-                              int linear_key_head_dim,     // TODO: migrate this to a class field
-                              int linear_num_key_heads,    // TODO: migrate this to a class field
-                              int linear_value_head_dim,   // TODO: migrate this to a class field
-                              int linear_num_value_heads,  // TODO: migrate this to a class field
-                              ffi::Optional<Tensor> mask, Tensor o_data, double sm_scale) final {
-    // qkvz:   [batch, seq_len, linear_key_head_dim*linear_num_key_heads*2 + linear_value_head_dim *
-    // linear_num_value_heads*2] 
-    // ba:     [batch, seq_len, linear_num_value_heads*2] o_data: [batch,
-    // seq_len, linear_num_value_heads * linear_value_head_dim ]
+  void GatedDeltaNetAttention(
+      int64_t layer_id, 
+      Tensor input_qk, // [2*batch, seq_len, num_k_heads, head_k_dim]
+      Tensor input_vz, // [2*batch, seq_len, num_v_heads, head_v_dim] 
+      Tensor input_ba, // [2*batch, seq_len, num_v_heads], beta/alpha params
+      ffi::Optional<Tensor> mask, 
+      Tensor o_data, double sm_scale) final {
     
-    //  Part 1. Shape and dtype check.
-    int linear_key_dim = linear_key_head_dim * linear_num_key_heads;
-    int linear_value_dim = linear_value_head_dim * linear_num_value_heads;
-   
+    // Part 1. Shape and dtype check.
     int64_t local_layer_id = layer_id - layer_id_begin_offset_;
     CHECK_GE(local_layer_id, 0);
     CHECK_LT(local_layer_id, num_layers_);
-
     Tensor pages = pages_[local_layer_id];
-    CHECK(input_qkvz.DataType() == pages.DataType());
+    CHECK(input_qk.DataType() == pages.DataType());
+    CHECK(input_vz.DataType() == pages.DataType());
     CHECK(input_ba.DataType() == pages.DataType());
     CHECK(o_data.DataType() == pages.DataType());
-    CHECK(attn_kinds_[layer_id] == AttnKind::kGatedDeltaNet);
-    CHECK_EQ(input_qkvz->ndim, 3);
-    CHECK_EQ(input_ba->ndim, 3);
-    CHECK_EQ(o_data->ndim, 3);
+    CHECK(attn_kinds_[layer_id] == AttnKind::kGatedDeltaNet);     
 
-    for (int dim = 0; dim < 3; ++dim) {
-      if (dim == 2) {
-        CHECK_EQ(input_qkvz->shape[dim], linear_key_dim * 2 + linear_value_dim * 2);
-        CHECK_EQ(input_ba->shape[dim], linear_num_value_heads * 2);
-        CHECK_EQ(o_data->shape[dim], linear_value_dim);
-      } else {
-        CHECK_EQ(input_qkvz->shape[dim], input_ba->shape[dim]);
-        CHECK_EQ(input_qkvz->shape[dim], o_data->shape[dim]);
-      }
-    }
-
-
-    // Gated Delta Net Attention from Qwen3-next models
-    // TODO: Implement Gated Delta Net attn here.
+   // Gated Delta Net Attention from Qwen3-next models
+   // TODO: Implement Gated Delta Net attn here.
     return;
   }
 
