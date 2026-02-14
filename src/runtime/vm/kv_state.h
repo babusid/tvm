@@ -167,24 +167,6 @@ class AttentionKVCacheObj : public KVStateObj {
                               int32_t recver_pe_offset) = 0;
 
   /************** Attention **************/
-  
-  /*!
-   * TODO: Update header comment
-   * \brief Compute GatedDeltaNet linear attention with Q/K/V/Z and B/A data which are concatenated along
-   * the head dimension.
-   * \param layer_id The model layer where the attention compute happens.
-   * \param qkv_data The input Q/K/V data, in layout
-   * `(total_length, num_qo_heads + 2 * num_kv_heads, head_dim)`.
-   * \param mask The input mask data, in layout `(total_sqr_length)`.
-   * \param o_data The output O data, in layout `(total_length, num_qo_heads, head_dim)`.
-   * \param sm_scale The additional attention scaling factor.
-   * \sa AttentionKVCache::Attention
-   */
-  virtual void GatedDeltaNetAttention(
-      int64_t layer_id, Tensor input_qk, Tensor input_vz, Tensor input_ba, 
-      ffi::Optional<Tensor> mask, Tensor o_data, double sm_scale
-      ) = 0;
-
 
   /*!
    * \brief Compute attention with Q/K/V data which are concatenated along
