@@ -3187,61 +3187,65 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype, page_size: int = 16):
     return compact_kv_copy_cpu
 
 
-# Gated Deltanet TIR kernels
+# Gated Deltanet kernels
+
 def _gen_causal_conv1d_update(
-    batch_size, 
-    hidden_size, 
-    seq_len, 
-    state_len, 
-    dtype="float32", 
-    activation="silu",
-    has_bias=True
+        hidden_size: int, 
+        state_len: int, 
+        dtype: str = "float32", 
+        activation: str ="silu",
+        has_bias: bool =True
 ):
+    _seq_len = tir.Var("seq_len", dtype="int64") # changes at runtime depending on prefill or decode
+    _batch_size = tir.Var("batch_size", dtype="int64") # changes at runtime
+    _hidden_size = tir.IntImm(dtype="int64", value=hidden_size) # from config
+    _state_len = tir.IntImm(dtype="int64", value=state_len) # from config
+    _dtype = DataType(dtype) # static
     hidden_states = te.placeholder(
-            (batch_size, hidden_size, seq_len), 
-            dtype=dtype, 
+            (_batch_size, _hidden_size, _seq_len), 
+            dtype=_dtype, 
             name="hidden_states"
     )
     conv_state = te.placeholder(
-            (batch_size, hidden_size, state_len), 
-            dtype=dtype, 
+            (_batch_size, _hidden_size, _state_len), 
+            dtype=_dtype, 
             name="conv_state"
     )
     weight = te.placeholder(
-            (hidden_size, 1, state_len), 
-            dtype=dtype, 
+            (_hidden_size, 1, _state_len), 
+            dtype=_dtype, 
             name="weight"
     )
     bias = None
     if has_bias:
-        bias = te.placeholder((hidden_size,), dtype=dtype, name="bias") 
+        bias = te.placeholder((_hidden_size,), dtype=_dtype, name="bias") 
 
     # Concatenation across the last dim
-    total_len = state_len + seq_len
+    total_len = _state_len + _seq_len
     hidden_states_new = te.compute(
-        (batch_size, hidden_size, total_len),
+        (_batch_size, _hidden_size, total_len),
         lambda b, h, l: te.if_then_else(
-            l < state_len, conv_state[b, h, l], hidden_states[b, h, l - state_len]
+            l < _state_len, conv_state[b, h, l], hidden_states[b, h, l - _state_len]
         ),
         name="hidden_states_new"
     )
 
     # Create new conv state only last state_len on last dim
     next_conv_state = te.compute(
-        (batch_size, hidden_size, state_len),
-        lambda b, h, s: hidden_states_new[b, h, s + seq_len],
+        (_batch_size, _hidden_size, _state_len),
+        lambda b, h, s: hidden_states_new[b, h, s + _seq_len],
         name="next_conv_state"
     )
 
     # Compute the causal convolution across the last dim of new_hidden_states
-    kw = te.reduce_axis((0, state_len), name="kw")
-    # conv_sum last dim is iterating across the input sequence (seq_len)
+    kw = te.reduce_axis((0, _state_len), name="kw")
+    # conv_sum last dim is iterating across the input sequence (_seq_len)
     # cs[b,h,0] looks at hidden_states_new[b,h,0] -> hidden_states_new[b,h, state_len]
     # then, the next token slides the window one to the right, so it uses 
     # hidden_states_new[b,h,1] -> hidden_states_new[b,h,state_len+1]
     # which includes token 0's input hidden state, and excludes the oldest cached hidden state 
     conv_sum = te.compute(
-        (batch_size, hidden_size, seq_len),
+        (_batch_size, _hidden_size, _seq_len),
         lambda b, h, s: te.sum(hidden_states_new[b, h, s + kw + 1] * weight[h, 0, kw], axis=kw),
         name="conv_sum"
     )
@@ -3258,7 +3262,7 @@ def _gen_causal_conv1d_update(
             val = silu(val)
         return val
 
-    out = te.compute((batch_size, hidden_size, seq_len), bias_and_act_logic, name="out")
+    out = te.compute((_batch_size, _hidden_size, _seq_len), bias_and_act_logic, name="out")
 
     # actually create primfunc 
     inputs = [hidden_states, conv_state, weight]
