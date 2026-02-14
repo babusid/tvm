@@ -1271,30 +1271,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                  sequence->kv_transfer_metadata.local_position_map.end());
   }
 
-  void GatedDeltaNetAttention(
-      int64_t layer_id, 
-      Tensor input_qk, // [2*batch, seq_len, num_k_heads, head_k_dim]
-      Tensor input_vz, // [2*batch, seq_len, num_v_heads, head_v_dim] 
-      Tensor input_ba, // [2*batch, seq_len, num_v_heads], beta/alpha params
-      ffi::Optional<Tensor> mask, 
-      Tensor o_data, double sm_scale) final {
-    
-    // Part 1. Shape and dtype check.
-    int64_t local_layer_id = layer_id - layer_id_begin_offset_;
-    CHECK_GE(local_layer_id, 0);
-    CHECK_LT(local_layer_id, num_layers_);
-    Tensor pages = pages_[local_layer_id];
-    CHECK(input_qk.DataType() == pages.DataType());
-    CHECK(input_vz.DataType() == pages.DataType());
-    CHECK(input_ba.DataType() == pages.DataType());
-    CHECK(o_data.DataType() == pages.DataType());
-    CHECK(attn_kinds_[layer_id] == AttnKind::kGatedDeltaNet);     
-
-   // Gated Delta Net Attention from Qwen3-next models
-   // TODO: Implement Gated Delta Net attn here.
-    return;
-  }
-
   void AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data, ffi::Optional<Tensor> mask,
                              Tensor o_data, double sm_scale) final {
     // Part 1. Shape and dtype check.

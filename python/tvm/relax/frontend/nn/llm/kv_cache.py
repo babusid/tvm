@@ -87,7 +87,6 @@ class AttnKind(enum.IntEnum):
     MHA = 0
     MLA = 1
     MHA_SLIDING = 3
-    GATED_DELTANET = 4
 
 
 class RopeMode(enum.IntEnum):
@@ -106,25 +105,6 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
     """The Paged KV Cache used in LLM batching for efficient attention computation."""
 
     extern_mods: List[tvm.runtime.Module] = []
-    
-    def gated_deltanet_attention(
-        self,
-        layer_id: int,
-        qk: Tensor,
-        vz: Tensor,
-        ba: Tensor,
-        num_qo_heads: int,
-        sm_scale: float,
-    ) -> Tensor:
-        """Compute gated deltanet linear attention with the given fused q/k/v/z data, fused β/α, and 
-        in-cache k/v data on the specified layer. Rotary position embeddings are 
-        not used for Gated Deltanet, and therefore are not applied within this function.
-        """
-        # pylint: disable=protected-access
-        # TODO: Implement this properly - call into the builtin that is defined
-        # Follow attn with fused QKV pattern
-
-        
 
     def attention_with_fused_qkv(
         self,
