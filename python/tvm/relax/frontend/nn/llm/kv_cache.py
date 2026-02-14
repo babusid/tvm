@@ -24,7 +24,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import tvm
 from tvm import relax as rx
-from tvm import tir, s_tir
+from tvm import s_tir, tir
+from tvm import te
 from tvm.relax.frontend.nn import Object, Tensor
 from tvm.runtime import DataType
 from tvm.script import tir as T
@@ -3183,3 +3184,94 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype, page_size: int = 16):
                             ]
 
     return compact_kv_copy_cpu
+
+
+# Gated Deltanet TIR kernels
+def _gen_causal_conv1d_update(
+    batch_size, 
+    hidden_size, 
+    seq_len, 
+    state_len, 
+    dtype="float32", 
+    activation="silu",
+    has_bias=True
+):
+    hidden_states = te.placeholder(
+            (batch_size, hidden_size, seq_len), 
+            dtype=dtype, 
+            name="hidden_states"
+    )
+    conv_state = te.placeholder(
+            (batch_size, hidden_size, state_len), 
+            dtype=dtype, 
+            name="conv_state"
+    )
+    weight = te.placeholder(
+            (hidden_size, 1, state_len), 
+            dtype=dtype, 
+            name="weight"
+    )
+    bias = None
+    if has_bias:
+        bias = te.placeholder((hidden_size,), dtype=dtype, name="bias") 
+
+    # Concatenation across the last dim
+    total_len = state_len + seq_len
+    hidden_states_new = te.compute(
+        (batch_size, hidden_size, total_len),
+        lambda b, h, l: te.if_then_else(
+            l < state_len, conv_state[b, h, l], hidden_states[b, h, l - state_len]
+        ),
+        name="hidden_states_new"
+    )
+
+    # Create new conv state only last state_len on last dim
+    next_conv_state = te.compute(
+        (batch_size, hidden_size, state_len),
+        lambda b, h, s: hidden_states_new[b, h, s + seq_len],
+        name="next_conv_state"
+    )
+
+    # Compute the causal convolution across the last dim of new_hidden_states
+    kw = te.reduce_axis((0, state_len), name="kw")
+    # conv_sum last dim is iterating across the input sequence (seq_len)
+    # cs[b,h,0] looks at hidden_states_new[b,h,0] -> hidden_states_new[b,h, state_len]
+    # then, the next token slides the window one to the right, so it uses 
+    # hidden_states_new[b,h,1] -> hidden_states_new[b,h,state_len+1]
+    # which includes token 0's input hidden state, and excludes the oldest cached hidden state 
+    conv_sum = te.compute(
+        (batch_size, hidden_size, seq_len),
+        lambda b, h, s: te.sum(hidden_states_new[b, h, s + kw + 1] * weight[h, 0, kw], axis=kw),
+        name="conv_sum"
+    )
+
+    # Bias and Activation
+    def silu(x):
+        return x * te.sigmoid(x)
+
+    def bias_and_act_logic(b, h, s):
+        val = conv_sum[b, h, s]
+        if has_bias:
+            val += bias[h]
+        if activation == "silu":
+            val = silu(val)
+        return val
+
+    out = te.compute((batch_size, hidden_size, seq_len), bias_and_act_logic, name="out")
+
+    # actually create primfunc 
+    inputs = [hidden_states, conv_state, weight]
+    if has_bias:
+        inputs.append(bias)
+    
+    # return both, next_conv needed for cache update
+    outputs = [next_conv_state, out]
+    
+    return te.create_prim_func(inputs + outputs)
+
+
+def _chunk_gated_delta_rule():
+    return
+
+def _chunk_recurrent_gated_delta_rule():
+    return
