@@ -88,6 +88,7 @@ class AttnKind(enum.IntEnum):
     MHA = 0
     MLA = 1
     MHA_SLIDING = 3
+    GATED_DELTANET = 4
 
 
 class RopeMode(enum.IntEnum):
