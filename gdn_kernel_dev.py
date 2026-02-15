@@ -11,73 +11,163 @@ def _gen_causal_conv1d_update(
     activation: str = "silu",
     has_bias: bool = True,
 ):
-    _seq_len = tir.Var(
-        "seq_len", dtype="int64"
-    )  # changes at runtime depending on prefill or decode
-    _batch_size = tir.Var("batch_size", dtype="int64")  # changes at runtime
-    _hidden_size = tir.IntImm(dtype="int64", value=hidden_size)  # from config
-    _state_len = tir.IntImm(dtype="int64", value=state_len)  # from config
-    _dtype = DataType(dtype)  # static
-    hidden_states = te.placeholder(
-        (_batch_size, _hidden_size, _seq_len), dtype=_dtype, name="hidden_states"
-    )
-    conv_state = te.placeholder(
-        (_batch_size, _hidden_size, _state_len), dtype=_dtype, name="conv_state"
-    )
-    weight = te.placeholder((_hidden_size, 1, _state_len), dtype=_dtype, name="weight")
-    bias = None
+    """
+    Generate a TIR primfunc for causal 1D convolution update.
+
+    Uses closure pattern to capture constants (hidden_size, state_len, etc.) at build time.
+    Uses TVMScript decorator syntax for cleaner, more readable TIR code.
+    Returns a tir.PrimFunc that can be compiled and executed.
+    
+    Note: Two separate primfuncs are defined (with and without bias) to ensure
+    the bias buffer is only present in the signature when has_bias=True.
+    """
+    # Capture constants in closure
+    _hidden_size = hidden_size
+    _state_len = state_len
+    _dtype = dtype
+    _activation = activation
+
+    @T.prim_func
+    def causal_conv1d_update_with_bias(
+        hidden_states: T.handle,
+        conv_state: T.handle,
+        weight: T.Buffer((T.int64(_hidden_size), T.int64(1), T.int64(_state_len)), _dtype),
+        bias: T.Buffer((T.int64(_hidden_size),), _dtype),
+        next_conv_state: T.handle,
+        out: T.handle,
+    ):
+        T.func_attr({"global_symbol": "causal_conv1d_update", "tir.noalias": True})
+
+        # Dynamic symbolic variables extracted from handles
+        batch_size = T.int64()
+        seq_len = T.int64()
+
+        # Match buffers with dynamic shapes
+        hidden_states_buf = T.match_buffer(
+            hidden_states, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype
+        )
+        conv_state_buf = T.match_buffer(
+            conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+        )
+        next_conv_state_buf = T.match_buffer(
+            next_conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+        )
+        out_buf = T.match_buffer(out, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
+
+        # Allocate intermediate buffers
+        hidden_states_new = T.alloc_buffer(
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len), dtype=_dtype
+        )
+        conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
+
+        # Step 1: Concatenate conv_state and hidden_states along last dimension
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len):
+            if l < T.int64(_state_len):
+                hidden_states_new[b, h, l] = conv_state_buf[b, h, l]
+            else:
+                hidden_states_new[b, h, l] = hidden_states_buf[b, h, l - T.int64(_state_len)]
+
+        # Step 2: Extract last state_len elements as next_conv_state
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+            next_conv_state_buf[b, h, s] = hidden_states_new[b, h, s + seq_len]
+
+        # Step 3: Initialize conv_sum to 0
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            conv_sum[b, h, s] = T.cast(T.float32(0.0), _dtype)
+
+        # Step 4: Compute causal convolution (sliding window)
+        # For each position s in output, convolve with state_len window ending at s+state_len
+        for b, h, s, kw in T.grid(batch_size, T.int64(_hidden_size), seq_len, T.int64(_state_len)):
+            conv_sum[b, h, s] = (
+                conv_sum[b, h, s]
+                + hidden_states_new[b, h, s + kw + T.int64(1)] * weight[h, T.int64(0), kw]
+            )
+
+        # Step 5: Add bias and apply activation
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            # Add bias
+            biased_val = conv_sum[b, h, s] + bias[h]
+
+            # Apply activation if enabled (closure constant)
+            if _activation == "silu":
+                # SiLU(x) = x * sigmoid(x)
+                val_float = T.cast(biased_val, "float32")
+                out_buf[b, h, s] = T.cast(val_float * T.sigmoid(val_float), _dtype)
+            else:
+                out_buf[b, h, s] = biased_val
+
+       
+    @T.prim_func
+    def causal_conv1d_update_no_bias(
+        hidden_states: T.handle,
+        conv_state: T.handle,
+        weight: T.Buffer((T.int64(_hidden_size), T.int64(1), T.int64(_state_len)), _dtype),
+        next_conv_state: T.handle,
+        out: T.handle,
+    ):
+        T.func_attr({"global_symbol": "causal_conv1d_update", "tir.noalias": True})
+
+        # Dynamic symbolic variables extracted from handles
+        batch_size = T.int64()
+        seq_len = T.int64()
+
+        # Match buffers with dynamic shapes
+        hidden_states_buf = T.match_buffer(
+            hidden_states, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype
+        )
+        conv_state_buf = T.match_buffer(
+            conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+        )
+        next_conv_state_buf = T.match_buffer(
+            next_conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+        )
+        out_buf = T.match_buffer(out, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
+
+        # Allocate intermediate buffers
+        hidden_states_new = T.alloc_buffer(
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len), dtype=_dtype
+        )
+        conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
+
+        # Step 1: Concatenate conv_state and hidden_states along last dimension
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len):
+            if l < T.int64(_state_len):
+                hidden_states_new[b, h, l] = conv_state_buf[b, h, l]
+            else:
+                hidden_states_new[b, h, l] = hidden_states_buf[b, h, l - T.int64(_state_len)]
+
+        # Step 2: Extract last state_len elements as next_conv_state
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+            next_conv_state_buf[b, h, s] = hidden_states_new[b, h, s + seq_len]
+
+        # Step 3: Initialize conv_sum to 0
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            conv_sum[b, h, s] = T.cast(T.float32(0.0), _dtype)
+
+        # Step 4: Compute causal convolution (sliding window)
+        # For each position s in output, convolve with state_len window ending at s+state_len
+        for b, h, s, kw in T.grid(batch_size, T.int64(_hidden_size), seq_len, T.int64(_state_len)):
+            conv_sum[b, h, s] = (
+                conv_sum[b, h, s]
+                + hidden_states_new[b, h, s + kw + T.int64(1)] * weight[h, T.int64(0), kw]
+            )
+
+        # Step 5: Apply activation (no bias)
+        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            val = conv_sum[b, h, s]
+
+            # Apply activation if enabled (closure constant)
+            if _activation == "silu":
+                # SiLU(x) = x * sigmoid(x)
+                val_float = T.cast(val, "float32")
+                out_buf[b, h, s] = T.cast(val_float * T.sigmoid(val_float), _dtype)
+            else:
+                out_buf[b, h, s] = val
+
     if has_bias:
-        bias = te.placeholder((_hidden_size,), dtype=_dtype, name="bias")
+        return causal_conv1d_update_with_bias
 
-    # Concatenation across the last dim
-    total_len = _state_len + _seq_len
-    hidden_states_new = te.compute(
-        (_batch_size, _hidden_size, total_len),
-        lambda b, h, l: te.if_then_else(
-            l < _state_len, conv_state[b, h, l], hidden_states[b, h, l - _state_len]
-        ),
-        name="hidden_states_new",
-    )
-
-    # Create new conv state only last state_len on last dim
-    next_conv_state = te.compute(
-        (_batch_size, _hidden_size, _state_len),
-        lambda b, h, s: hidden_states_new[b, h, s + _seq_len],
-        name="next_conv_state",
-    )
-
-    # Compute the causal convolution across the last dim of new_hidden_states
-    kw = te.reduce_axis((0, _state_len), name="kw")
-    # conv_sum last dim is iterating across the input sequence (_seq_len)
-    # cs[b,h,0] looks at hidden_states_new[b,h,0] -> hidden_states_new[b,h, state_len]
-    # then, the next token slides the window one to the right, so it uses
-    # hidden_states_new[b,h,1] -> hidden_states_new[b,h,state_len+1]
-    # which includes token 0's input hidden state, and excludes the oldest cached hidden state
-    conv_sum = te.compute(
-        (_batch_size, _hidden_size, _seq_len),
-        lambda b, h, s: te.sum(hidden_states_new[b, h, s + kw + 1] * weight[h, 0, kw], axis=kw),
-        name="conv_sum",
-    )
-
-    def bias_and_act_logic(b, h, s):
-        val = conv_sum[b, h, s]
-        if has_bias:
-            val += bias[h]
-        if activation == "silu":
-            val = val * te.sigmoid(val)
-        return val
-
-    out = te.compute((_batch_size, _hidden_size, _seq_len), bias_and_act_logic, name="out")
-
-    # actually create primfunc
-    inputs = [hidden_states, conv_state, weight]
-    if has_bias:
-        inputs.append(bias)
-
-    # return both, next_conv needed for cache update
-    outputs = [next_conv_state, out]
-
-    return te.create_prim_func(inputs + outputs)
+    return causal_conv1d_update_no_bias
 
 
 def _chunk_gated_delta_rule(
