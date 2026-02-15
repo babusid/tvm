@@ -1,6 +1,6 @@
 import tvm
 from tvm import DataType, te, tir, s_tir, topi
-
+import math
 def _gen_causal_conv1d_update(
         hidden_size: int, 
         state_len: int, 
@@ -101,7 +101,7 @@ def _chunk_gated_delta_rule(
     _batch_size = tir.Var("batch_size", dtype="int64") # changes at runtime
     _dtype = DataType(dtype)
 
-    nodes = []
+    inputs = []
 
     query: te.Tensor = te.placeholder(
         shape=(_batch_size, _seq_len, _linear_num_value_heads, _linear_key_head_dim),
@@ -131,7 +131,7 @@ def _chunk_gated_delta_rule(
             name="beta"
     )
 
-    nodes.extend([query, key, value, g, beta])
+    inputs.extend([query, key, value, g, beta])
     if use_qk_l2norm_in_kernel:
         # do l2 norm on query and key here
         query_sq = te.compute(
@@ -163,17 +163,106 @@ def _chunk_gated_delta_rule(
             lambda i,j,k,l: key[i,j,k,l] * te.rsqrt(key_sum[i,j,k,0] + eps),
             "k_norm"
         )
-        # add intermediates to comp graph
-        nodes.extend([query_sq, key_sq, query_sum, key_sum])
+        # set query and key to l2normed versions
         query = q_norm
         key = k_norm
+    
+    transaxes = [0,2,1,3]
+    query = topi.transpose(query, transaxes)
+    key = topi.transpose(key, transaxes)
+    value = topi.transpose(value, transaxes)
+    
+    transaxes.pop()
+    beta = topi.transpose(beta, transaxes)
+    g = topi.transpose(g, transaxes)
 
-    query_transpose =
+    pad_size = (_chunk_size - _seq_len % _chunk_size) % _chunk_size
+    query = topi.nn.pad(
+            query,
+            pad_before=[0,0,0,0],
+            pad_after=[0,0,pad_size,0],
+            pad_value=0.0
+    )
+    key = topi.nn.pad(
+            key,
+            pad_before=[0,0,0,0],
+            pad_after=[0,0,pad_size,0],
+            pad_value=0.0
+    )
+    value = topi.nn.pad(
+            value,
+            pad_before=[0,0,0,0],
+            pad_after=[0,0,pad_size,0],
+            pad_value=0.0
+    )
+    beta = topi.nn.pad(
+            beta,
+            pad_before=[0,0,0],
+            pad_after=[0,0,pad_size],
+            pad_value=0.0
+    )
+    g = topi.nn.pad(
+            g,
+            pad_before=[0,0,0],
+            pad_after=[0,0,pad_size],
+            pad_value=0.0
+    )
+    
+    total_seq_len = _seq_len + pad_size
+    # scale = tir.rsqrt(tir.Cast("float33", query.shape[-1]))
+    # PERF TODO: move to doing during norm and replace topi.transpose with manual te.compute
+    # that can do the transpose and the scaling together. 
+    scale = tir.FloatImm("float32", 1/math.sqrt(linear_key_head_dim)) #resolve at compile
+    query *= scale
 
-    basefunc: tir.PrimFunc = te.create_prim_func(nodes)
+    v_beta = value * topi.expand_dims(beta, axis=-1)
+    k_beta = key * topi.expand_dims(beta, axis=-1)
+
+    query = topi.reshape(query, (_batch_size, _linear_num_value_heads, -1, chunk_size, query.shape[-1]))
+    key = topi.reshape(key, (_batch_size, _linear_num_value_heads, -1, chunk_size, key.shape[-1]))
+    value = topi.reshape(value, (_batch_size, _linear_num_value_heads, -1, chunk_size, value.shape[-1]))
+    k_beta = topi.reshape(k_beta, (_batch_size, _linear_num_value_heads, -1, chunk_size, k_beta.shape[-1]))
+    v_beta = topi.reshape(v_beta, (_batch_size, _linear_num_value_heads, -1, chunk_size, v_beta.shape[-1]))
+    g = topi.reshape(g, (_batch_size, _linear_num_value_heads, -1, chunk_size))
+
+    mask = topi.trilu(topi.full((chunk_size, chunk_size), dtype='int32', fill_value=1), k=tir.IntImm("int32", 0), upper=True)
+    g = topi.cumsum(g, axis=-1)
+    g_col = topi.expand_dims(g, axis=-1)
+    g_row = topi.expand_dims(g, axis=-2)
+    decay_mask = topi.trilu((
+        topi.exp(
+            topi.trilu(
+                topi.subtract(g_col, g_row),
+                k=tir.IntImm("int32", 0),
+                upper=False
+            )
+        )),
+        k=tir.IntImm("int32", 0),
+        upper=False
+    )
+
+    # batched matmul, transposed key
+    attn_mm_reduce_k = te.reduce_axis((0, _linear_key_head_dim), name="attm_mm_reduce_k")
+    attn = te.compute(
+            (k_beta.shape[0], k_beta.shape[1], k_beta.shape[2], chunk_size, chunk_size),
+            lambda b, h, c, i, j: te.sum(
+                k_beta[b,h,c,i, attn_mm_reduce_k] * key[b,h,c,j,attn_mm_reduce_k],
+                axis=attn_mm_reduce_k
+            ),
+            name="attn"
+    )
+    attn *= decay_mask
+    attn *= topi.subtract(
+            topi.full_like(mask, 1),
+            topi.cast(mask, "float32")
+    )
+
+    outputs = [query, key, value, mask, g, decay_mask, attn]
+    basefunc: tir.PrimFunc = te.create_prim_func(inputs+outputs)
     return basefunc
     # TODO: once these functions actually work, experiment with loop fusions
-    # etc. to make the kernels performant. May have to switch to hand-written
+    # etc. to make the kernels performant. Can also reorder ops and inline things
+    # into more compound te.compute blocks. May have to switch to hand-written
     # tir to really optimize it.
 
 def _chunk_recurrent_gated_delta_rule():
@@ -182,5 +271,5 @@ def _chunk_recurrent_gated_delta_rule():
     return te.create_prim_func(inputs + outputs)
 
 print(_gen_causal_conv1d_update(128, 128).script())
-print(_chunk_gated_delta_rule(128,128,128,128,use_qk_l2norm_in_kernel=False).script())
-print(_chunk_gated_delta_rule(128,128,128,128,use_qk_l2norm_in_kernel=True).script())
+print(_chunk_gated_delta_rule(32,128,16,128,use_qk_l2norm_in_kernel=False).script())
+print(_chunk_gated_delta_rule(32,128,16,128,use_qk_l2norm_in_kernel=True).script())
