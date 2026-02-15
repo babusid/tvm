@@ -1,3 +1,4 @@
+from torch import chunk
 import tvm
 from tvm import DataType, te, tir, s_tir, topi
 from tvm.script import tir as T
@@ -181,9 +182,9 @@ def _chunk_gated_delta_rule(
     ) 
     
     total_seq_len = _seq_len + pad_size
+    num_chunks = tir.ceildiv(total_seq_len, _chunk_size)  # Explicitly compute number of chunks
+    
     # scale = tir.rsqrt(tir.Cast("float33", query.shape[-1]))
-    # PERF TODO: move to doing during norm and replace topi.transpose with manual te.compute
-    # that can do the transpose and the scaling together.
     scale = tir.FloatImm("float32", 1 / math.sqrt(linear_key_head_dim))  # resolve at compile
     query *= scale
 
@@ -191,22 +192,22 @@ def _chunk_gated_delta_rule(
     k_beta = key * topi.expand_dims(beta, axis=-1)
 
     query = topi.reshape(
-        query, (_batch_size, _linear_num_value_heads, -1, chunk_size, query.shape[-1])
+        query, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, query.shape[-1])
     )
-    key = topi.reshape(key, (_batch_size, _linear_num_value_heads, -1, chunk_size, key.shape[-1]))
+    key = topi.reshape(key, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, key.shape[-1]))
     value = topi.reshape(
-        value, (_batch_size, _linear_num_value_heads, -1, chunk_size, value.shape[-1])
+        value, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, value.shape[-1])
     )
     k_beta = topi.reshape(
-        k_beta, (_batch_size, _linear_num_value_heads, -1, chunk_size, k_beta.shape[-1])
+        k_beta, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, k_beta.shape[-1])
     )
     v_beta = topi.reshape(
-        v_beta, (_batch_size, _linear_num_value_heads, -1, chunk_size, v_beta.shape[-1])
+        v_beta, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, v_beta.shape[-1])
     )
-    g = topi.reshape(g, (_batch_size, _linear_num_value_heads, -1, chunk_size))
+    g = topi.reshape(g, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size))
 
     mask = topi.trilu(
-        topi.full((chunk_size, chunk_size), dtype="int32", fill_value=1),
+        topi.full((_chunk_size, _chunk_size), dtype="int32", fill_value=1),
         k=tir.IntImm("int32", 0),
         upper=True,
     )
@@ -222,7 +223,7 @@ def _chunk_gated_delta_rule(
     # batched matmul, transposed key
     attn_mm_reduce_k = te.reduce_axis((0, _linear_key_head_dim), name="attm_mm_reduce_k")
     attn = te.compute(
-        (k_beta.shape[0], k_beta.shape[1], k_beta.shape[2], chunk_size, chunk_size),
+        (k_beta.shape[0], k_beta.shape[1], k_beta.shape[2], _chunk_size, _chunk_size),
         lambda b, h, c, i, j: te.sum(
             k_beta[b, h, c, i, attn_mm_reduce_k] * key[b, h, c, j, attn_mm_reduce_k],
             axis=attn_mm_reduce_k,
@@ -231,6 +232,33 @@ def _chunk_gated_delta_rule(
     )
     attn *= decay_mask
     attn *= topi.subtract(topi.full_like(mask, 1), topi.cast(mask, "float32"))
+    attn = topi.negative(attn)
+    
+    @T.prim_func
+    def prefix_scan_attn_update(
+        _attn_in: T.handle,
+        _attn_out: T.handle
+    ):
+        attn_buf = T.match_buffer(_attn_in, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size))
+        attn_out = T.match_buffer(_attn_out, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size))
+        T.func_attr({"tir.noalias": True})
+        # parallelize over leading dims
+        for b, h, c in T.grid(_batch_size, _linear_num_value_heads, num_chunks):
+            # for each row in the 2nd to last dim
+            for i in T.serial(1, _chunk_size):
+                for j in T.grid(i): # lower triangle of matrix, j<i
+                    acc = T.float32(0.0)
+                    for k in T.serial(j+1, i): 
+                        rowvalue = attn_buf[b,h,c,i,k] # kth value of current row
+                        colvalue = attn_buf[b,h,c,k,j] # kth value of jth column where j <i
+                        acc += rowvalue * colvalue # add to accumulator - accum row-wise sum of muls across cols
+                    attn_out[b,h,c,i,j] = attn_buf[b,h,c,i,j] + acc
+                for j in T.grid(_chunk_size - i):
+                    # upper triangle copy
+                    attn_out[b,h,c,i,i+j] = attn_buf[b,h,c,i,i+j]
+    
+    attn = te.extern_primfunc([attn], prefix_scan_attn_update)
+
 
     outputs = [query, key, value, mask, g, decay_mask, attn]
     basefunc: tir.PrimFunc = te.create_prim_func(inputs + outputs)
