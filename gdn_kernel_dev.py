@@ -1,4 +1,3 @@
-from torch import chunk
 import tvm
 from tvm import DataType, te, tir, s_tir, topi
 from tvm.script import tir as T
@@ -234,30 +233,42 @@ def _chunk_gated_delta_rule(
     attn *= topi.subtract(topi.full_like(mask, 1), topi.cast(mask, "float32"))
     attn = topi.negative(attn)
     
-    @T.prim_func
-    def prefix_scan_attn_update(
-        _attn_in: T.handle,
-        _attn_out: T.handle
-    ):
-        attn_buf = T.match_buffer(_attn_in, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size))
-        attn_out = T.match_buffer(_attn_out, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size))
-        T.func_attr({"tir.noalias": True})
-        # parallelize over leading dims
-        for b, h, c in T.grid(_batch_size, _linear_num_value_heads, num_chunks):
-            # for each row in the 2nd to last dim
-            for i in T.serial(1, _chunk_size):
-                for j in T.grid(i): # lower triangle of matrix, j<i
-                    acc = T.float32(0.0)
-                    for k in T.serial(j+1, i): 
-                        rowvalue = attn_buf[b,h,c,i,k] # kth value of current row
-                        colvalue = attn_buf[b,h,c,k,j] # kth value of jth column where j <i
-                        acc += rowvalue * colvalue # add to accumulator - accum row-wise sum of muls across cols
-                    attn_out[b,h,c,i,j] = attn_buf[b,h,c,i,j] + acc
-                for j in T.grid(_chunk_size - i):
-                    # upper triangle copy
-                    attn_out[b,h,c,i,i+j] = attn_buf[b,h,c,i,i+j]
+    def gen_prefix_scan_ir(attn_in, attn_out):
+        from tvm.script.ir_builder import IRBuilder
+        from tvm.script.ir_builder import tir as T
+        
+        attn_buf = T.buffer_proxy(attn_in)
+        out_buf = T.buffer_proxy(attn_out)
+        
+        with IRBuilder() as ib:
+            with T.seq_scope():
+                # Parallelize over leading dimensions 
+                with T.parallel(0, _batch_size) as b:
+                    with T.parallel(0, _linear_num_value_heads) as h:
+                        with T.parallel(0, num_chunks) as c:
+                            # inner loop has to be sequential
+                            # for some reason python loop works but
+                            # T.serial is failing
+                            for i in range(1, chunk_size): 
+                                for j in range(i):
+                                    acc = T.float32(0.0)
+                                    for k in range(j + 1, i):
+                                        rowvalue = attn_buf[b, h, c, i, k]
+                                        colvalue = attn_buf[b, h, c, k, j]
+                                        acc += rowvalue * colvalue
+                                    out_buf[b, h, c, i, j] = attn_buf[b, h, c, i, j] + acc
+                                for j in range(int(_chunk_size.value) - i):
+                                    out_buf[b, h, c, i, i + j] = attn_buf[b, h, c, i, i + j]
+        
+        return ib.get()
     
-    attn = te.extern_primfunc([attn], prefix_scan_attn_update)
+    attn = te.extern(
+        attn.shape,
+        [attn],
+        lambda ins, outs: gen_prefix_scan_ir(ins[0], outs[0]),
+        name="prefix_scan_attn_update",
+        dtype=dtype,
+    )
 
 
     outputs = [query, key, value, mask, g, decay_mask, attn]
