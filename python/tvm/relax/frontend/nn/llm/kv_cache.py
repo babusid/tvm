@@ -3195,6 +3195,20 @@ def _gen_causal_conv1d_update(
         activation: str ="silu",
         has_bias: bool =True
 ):
+    """
+    This generates a TIR kernel that takes in 
+    - sequence length
+    - batch size
+    - hidden states (of current request)
+    - conv state (cached state)
+    - convolution weight
+    - convolution bias
+    It then performs a causal 1d convolution, and returns the new
+    state to cache, as well as the output for further operations.
+    At compile time, the hidden size, state length, and datatype 
+    become constants.
+    """
+
     _seq_len = tir.Var("seq_len", dtype="int64") # changes at runtime depending on prefill or decode
     _batch_size = tir.Var("batch_size", dtype="int64") # changes at runtime
     _hidden_size = tir.IntImm(dtype="int64", value=hidden_size) # from config
@@ -3249,16 +3263,12 @@ def _gen_causal_conv1d_update(
         name="conv_sum"
     )
 
-    # Bias and Activation
-    def silu(x):
-        return x * te.sigmoid(x)
-
     def bias_and_act_logic(b, h, s):
         val = conv_sum[b, h, s]
         if has_bias:
             val += bias[h]
         if activation == "silu":
-            val = silu(val)
+            val = val * te.sigmoid(val)
         return val
 
     out = te.compute((_batch_size, _hidden_size, _seq_len), bias_and_act_logic, name="out")
