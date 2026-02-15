@@ -242,22 +242,22 @@ def _chunk_gated_delta_rule(
         
         with IRBuilder() as ib:
             with T.seq_scope():
-                # Parallelize over leading dimensions 
-                with T.parallel(0, _batch_size) as b:
-                    with T.parallel(0, _linear_num_value_heads) as h:
-                        with T.parallel(0, num_chunks) as c:
-                            # inner loop has to be sequential
-                            # for some reason python loop works but
-                            # T.serial is failing
-                            for i in range(1, chunk_size): 
-                                for j in range(i):
+                with T.serial(0, _batch_size) as b:
+                    with T.serial(0, _linear_num_value_heads) as h:
+                        with T.serial(0, num_chunks) as c:
+                            # Sequential inner loops with symbolic bounds
+                            with T.serial(1, _chunk_size) as i:
+                                # j from 0 to i (lower triangle, has to do the prefix)
+                                with T.serial(0, i) as j:
                                     acc = T.float32(0.0)
-                                    for k in range(j + 1, i):
-                                        rowvalue = attn_buf[b, h, c, i, k]
-                                        colvalue = attn_buf[b, h, c, k, j]
-                                        acc += rowvalue * colvalue
-                                    out_buf[b, h, c, i, j] = attn_buf[b, h, c, i, j] + acc
-                                for j in range(int(_chunk_size.value) - i):
+                                    # k from j+1 to i (inner product)
+                                    with T.serial(j+1, i) as k:
+                                        rowvalue = attn_buf[b, h, c, i, k] # grab kth value of ith row
+                                        colvalue = attn_buf[b, h, c, k, j] # grab kth row of jth column, j < i
+                                        acc += rowvalue * colvalue # accumulate a rowsum of the dot product
+                                    out_buf[b, h, c, i, j] = attn_buf[b, h, c, i, j] + acc # store the rowsum plus original
+                                # Upper triangle copy: j from 0 to chunk_size-i
+                                with T.serial(0, _chunk_size - i) as j:
                                     out_buf[b, h, c, i, i + j] = attn_buf[b, h, c, i, i + j]
         
         return ib.get()
