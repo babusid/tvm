@@ -180,194 +180,398 @@ def _chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     dtype: str = "float32",
 ):
-    _linear_num_value_heads = tir.IntImm("int64", linear_num_value_heads)
-    _linear_value_head_dim = tir.IntImm("int64", linear_value_head_dim)
-    _linear_num_key_heads = tir.IntImm("int64", linear_num_key_heads)
-    _linear_key_head_dim = tir.IntImm("int64", linear_key_head_dim)
-    _chunk_size = tir.IntImm("int64", chunk_size)
-    _seq_len = tir.Var("seq_len", dtype="int64")  # changes at runtime
-    _batch_size = tir.Var("batch_size", dtype="int64")  # changes at runtime
-    _dtype = DataType(dtype)
+    """
+    Generate a TIR primfunc for chunked gated delta rule (prefill path).
 
-    inputs = []
+    Refactored from TE/TOPI to pure TVMScript @T.prim_func to get explicit
+    control over loop serialization in the prefix scan. The prefix scan has
+    a sequential dependency: row i depends on the fully-computed output of
+    rows 0..i-1. The prior TE-based te.extern approach with nested IRBuilder
+    T.serial loops produced broken IR where the inner accumulation loop was
+    compiled away to a no-op.
 
-    query: te.Tensor = te.placeholder(
-        shape=(_batch_size, _seq_len, _linear_num_value_heads, _linear_key_head_dim),
-        dtype=_dtype,
-        name="query",
-    )
+    Strategy for prefix scan:
+      - Fuse (batch, heads, chunks) into a single T.parallel loop
+      - Use T.serial for the row loop (i) and bare range loops for (j, k)
+      - This mirrors the pattern used by topi.cumsum (scan.py) which TVM
+        correctly lowers: T.parallel for independent dims, T.serial for
+        the sequential scan dimension.
 
-    key: te.Tensor = te.placeholder(
-        shape=(_batch_size, _seq_len, _linear_num_value_heads, _linear_key_head_dim),
-        dtype=_dtype,
-        name="key",
-    )
+    Reference: qwen3_gdn.py torch_chunk_gated_delta_rule lines 146-263
+    """
+    # Capture compile-time constants
+    _num_heads = linear_num_value_heads
+    _key_dim = linear_key_head_dim
+    _val_dim = linear_value_head_dim
+    _C = chunk_size
+    _dtype = dtype
+    _scale = 1.0 / math.sqrt(linear_key_head_dim)
+    _eps = 1e-6
 
-    value: te.Tensor = te.placeholder(
-        shape=(_batch_size, _seq_len, _linear_num_value_heads, _linear_value_head_dim),
-        dtype=_dtype,
-        name="value",
-    )
-
-    g: te.Tensor = te.placeholder((_batch_size, _seq_len, _linear_num_value_heads))
-
-    beta: te.Tensor = te.placeholder(
-        (_batch_size, _seq_len, _linear_num_value_heads), dtype=_dtype, name="beta"
-    )
-
-    inputs.extend([query, key, value, g, beta])
     if use_qk_l2norm_in_kernel:
-        # do l2 norm on query and key here
-        query_sq = te.compute(
-            query.shape, lambda b, s, n, d: query[b, s, n, d] * query[b, s, n, d], name="query_sq"
-        )
-        key_sq = te.compute(
-            key.shape, lambda b, s, n, d: key[b, s, n, d] * key[b, s, n, d], name="key_sq"
-        )
+        @T.prim_func
+        def chunk_gated_delta_rule(
+            var_query: T.handle,
+            var_key: T.handle,
+            var_value: T.handle,
+            var_g: T.handle,
+            var_beta: T.handle,
+            # Outputs
+            var_out_query: T.handle,
+            var_out_key: T.handle,
+            var_out_value: T.handle,
+            out_mask: T.Buffer((T.int64(_C), T.int64(_C)), "int32"),
+            var_out_g_cumsum: T.handle,
+            var_out_decay_mask: T.handle,
+            var_out_attn: T.handle,
+        ):
+            T.func_attr({"global_symbol": "chunk_gated_delta_rule", "tir.noalias": True})
 
-        rv = te.reduce_axis((0, _linear_key_head_dim), name="rv")
-        query_sum = te.compute(
-            (_batch_size, _seq_len, _linear_num_value_heads, 1),
-            lambda i, j, k, l: te.sum(query_sq[i, j, k, rv], axis=rv),
-            name="query_sum",
-        )
-        key_sum = te.compute(
-            (_batch_size, _seq_len, _linear_num_value_heads, 1),
-            lambda i, j, k, l: te.sum(key_sq[i, j, k, rv], axis=rv),
-            name="key_sum",
-        )
-        eps = tir.FloatImm("float32", 1e-6)  # hardcode for now
-        q_norm = te.compute(
-            (_batch_size, _seq_len, _linear_num_value_heads, _linear_key_head_dim),
-            lambda i, j, k, l: query[i, j, k, l] * te.rsqrt(query_sum[i, j, k, 0] + eps),
-            "q_norm",
-        )
-        k_norm = te.compute(
-            (_batch_size, _seq_len, _linear_num_value_heads, _linear_key_head_dim),
-            lambda i, j, k, l: key[i, j, k, l] * te.rsqrt(key_sum[i, j, k, 0] + eps),
-            "k_norm",
-        )
-        # set query and key to l2normed versions
-        query = q_norm
-        key = k_norm
+            # --- Symbolic shape variables ---
+            # All declared as bare T.int64() so match_buffer and alloc_buffer
+            # stay at PrimFunc top (no LetFrames pushed).
+            # The caller must pass buffers with:
+            #   num_chunks = ceildiv(seq_len, chunk_size)
+            # total_len is not a separate symbolic var; we use
+            # num_chunks * chunk_size wherever total_len was needed.
+            batch_size = T.int64()
+            seq_len = T.int64()
+            num_chunks = T.int64()
 
-    transaxes = [0, 2, 1, 3]
-    query = topi.transpose(query, transaxes)
-    key = topi.transpose(key, transaxes)
-    value = topi.transpose(value, transaxes)
+            # --- Input buffers ---
+            query = T.match_buffer(var_query, (batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)), _dtype)
+            key = T.match_buffer(var_key, (batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)), _dtype)
+            value = T.match_buffer(var_value, (batch_size, seq_len, T.int64(_num_heads), T.int64(_val_dim)), _dtype)
+            g_in = T.match_buffer(var_g, (batch_size, seq_len, T.int64(_num_heads)), _dtype)
+            beta_in = T.match_buffer(var_beta, (batch_size, seq_len, T.int64(_num_heads)), _dtype)
 
-    transaxes = [0, 2, 1]
-    beta = topi.transpose(beta, transaxes)
-    g = topi.transpose(g, transaxes)
+            # --- Output buffers ---
+            out_query = T.match_buffer(var_out_query, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            out_key = T.match_buffer(var_out_key, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            out_value = T.match_buffer(var_out_value, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)), _dtype)
+            out_g_cumsum = T.match_buffer(var_out_g_cumsum, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)), _dtype)
+            out_decay_mask = T.match_buffer(var_out_decay_mask, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+            out_attn = T.match_buffer(var_out_attn, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
 
-    pad_size = (_chunk_size - _seq_len % _chunk_size) % _chunk_size
-    query, key, value = tuple(
-        topi.nn.pad(x, pad_before=[0, 0, 0, 0], pad_after=[0, 0, pad_size, 0], pad_value=0.0)
-        for x in (query, key, value)
-    )
-    beta, g = tuple(
-        topi.nn.pad(x, pad_before=[0, 0, 0], pad_after=[0, 0, pad_size], pad_value=0.0)
-        for x in (beta, g)
-    ) 
-    
-    total_seq_len = _seq_len + pad_size
-    num_chunks = tir.ceildiv(total_seq_len, _chunk_size)  # Explicitly compute number of chunks
-    
-    # scale = tir.rsqrt(tir.Cast("float33", query.shape[-1]))
-    scale = tir.FloatImm("float32", 1 / math.sqrt(linear_key_head_dim))  # resolve at compile
-    query *= scale
+            # --- Intermediate buffers ---
+            # Transposed + padded inputs: (batch, heads, num_chunks*C, dim)
+            q_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)), _dtype)
+            k_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)), _dtype)
+            v_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)), _dtype)
+            beta_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)), _dtype)
+            g_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)), _dtype)
 
-    v_beta = value * topi.expand_dims(beta, axis=-1)
-    k_beta = key * topi.expand_dims(beta, axis=-1)
+            # L2 norm intermediates
+            q_norm_sq_sum = T.alloc_buffer((batch_size, seq_len, T.int64(_num_heads)), _dtype)
+            k_norm_sq_sum = T.alloc_buffer((batch_size, seq_len, T.int64(_num_heads)), _dtype)
 
-    query = topi.reshape(
-        query, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, query.shape[-1])
-    )
-    key = topi.reshape(key, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, key.shape[-1]))
-    value = topi.reshape(
-        value, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, value.shape[-1])
-    )
-    k_beta = topi.reshape(
-        k_beta, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, k_beta.shape[-1])
-    )
-    v_beta = topi.reshape(
-        v_beta, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size, v_beta.shape[-1])
-    )
-    g = topi.reshape(g, (_batch_size, _linear_num_value_heads, num_chunks, _chunk_size))
+            # Chunked intermediates
+            g_cumsum = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)), _dtype)
+            k_beta_chunk = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            attn_raw = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+            attn_masked = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
 
-    mask = topi.trilu(
-        topi.full((_chunk_size, _chunk_size), dtype="int32", fill_value=1),
-        k=tir.IntImm("int32", 0),
-        upper=True,
-    )
-    g = topi.cumsum(g, axis=-1)
-    g_col = topi.expand_dims(g, axis=-1)
-    g_row = topi.expand_dims(g, axis=-2)
-    decay_mask = topi.trilu(
-        (topi.exp(topi.trilu(topi.subtract(g_col, g_row), k=tir.IntImm("int32", 0), upper=False))),
-        k=tir.IntImm("int32", 0),
-        upper=False,
-    )
+            # ================================================================
+            # Step 1: L2 normalize query and key
+            # ================================================================
+            # Compute sum of squares per (batch, seq, head)
+            for b, s, n in T.grid(batch_size, seq_len, T.int64(_num_heads)):
+                q_norm_sq_sum[b, s, n] = T.float32(0)
+                k_norm_sq_sum[b, s, n] = T.float32(0)
+            for b, s, n, d in T.grid(batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)):
+                q_norm_sq_sum[b, s, n] = q_norm_sq_sum[b, s, n] + query[b, s, n, d] * query[b, s, n, d]
+                k_norm_sq_sum[b, s, n] = k_norm_sq_sum[b, s, n] + key[b, s, n, d] * key[b, s, n, d]
 
-    # batched matmul, transposed key
-    attn_mm_reduce_k = te.reduce_axis((0, _linear_key_head_dim), name="attm_mm_reduce_k")
-    attn = te.compute(
-        (k_beta.shape[0], k_beta.shape[1], k_beta.shape[2], _chunk_size, _chunk_size),
-        lambda b, h, c, i, j: te.sum(
-            k_beta[b, h, c, i, attn_mm_reduce_k] * key[b, h, c, j, attn_mm_reduce_k],
-            axis=attn_mm_reduce_k,
-        ),
-        name="attn",
-    )
-    attn *= decay_mask
-    attn *= topi.subtract(topi.full_like(mask, 1), topi.cast(mask, "float32"))
-    attn = topi.negative(attn)
-    
-    def gen_prefix_scan_ir(attn_in, attn_out):
-        from tvm.script.ir_builder import IRBuilder
-        from tvm.script.ir_builder import tir as T
-        
-        attn_buf = T.buffer_proxy(attn_in)
-        out_buf = T.buffer_proxy(attn_out)
-        
-        with IRBuilder() as ib:
-            with T.seq_scope():
-                with T.serial(0, _batch_size) as b:
-                    with T.serial(0, _linear_num_value_heads) as h:
-                        with T.serial(0, num_chunks) as c:
-                            # Sequential inner loops with symbolic bounds
-                            with T.serial(1, _chunk_size) as i:
-                                # j from 0 to i (lower triangle, has to do the prefix)
-                                with T.serial(0, i) as j:
-                                    acc = T.float32(0.0)
-                                    # k from j+1 to i (inner product)
-                                    with T.serial(j+1, i) as k:
-                                        rowvalue = attn_buf[b, h, c, i, k] # grab kth value of ith row
-                                        colvalue = attn_buf[b, h, c, k, j] # grab kth row of jth column, j < i
-                                        acc += rowvalue * colvalue # accumulate a rowsum of the dot product
-                                    out_buf[b, h, c, i, j] = attn_buf[b, h, c, i, j] + acc # store the rowsum plus original
-                                # Upper triangle copy: j from 0 to chunk_size-i
-                                with T.serial(0, _chunk_size - i) as j:
-                                    out_buf[b, h, c, i, i + j] = attn_buf[b, h, c, i, i + j]
-        
-        return ib.get()
-    
-    attn = te.extern(
-        attn.shape,
-        [attn],
-        lambda ins, outs: gen_prefix_scan_ir(ins[0], outs[0]),
-        name="prefix_scan_attn_update",
-        dtype=dtype,
-    )
+            # ================================================================
+            # Step 2: Transpose (b,s,n,d) -> (b,n,s,d), apply L2 norm, scale
+            #         query, and pad to chunk boundary. Also transpose+pad
+            #         beta and g from (b,s,n) -> (b,n,s).
+            # ================================================================
+            for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)):
+                if s < seq_len:
+                    q_tp[b, n, s, d] = query[b, s, n, d] * T.rsqrt(q_norm_sq_sum[b, s, n] + T.float32(_eps)) * T.float32(_scale)
+                    k_tp[b, n, s, d] = key[b, s, n, d] * T.rsqrt(k_norm_sq_sum[b, s, n] + T.float32(_eps))
+                else:
+                    q_tp[b, n, s, d] = T.float32(0)
+                    k_tp[b, n, s, d] = T.float32(0)
 
+            for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)):
+                if s < seq_len:
+                    v_tp[b, n, s, d] = value[b, s, n, d]
+                else:
+                    v_tp[b, n, s, d] = T.float32(0)
 
-    outputs = [query, key, value, mask, g, decay_mask, attn]
-    basefunc: tir.PrimFunc = te.create_prim_func(inputs + outputs)
-    return basefunc
-    # TODO: once these functions actually work, experiment with loop fusions
-    # etc. to make the kernels performant. Can also reorder ops and inline things
-    # into more compound te.compute blocks. May have to switch to hand-written
-    # tir to really optimize it.
+            for b, n, s in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)):
+                if s < seq_len:
+                    beta_tp[b, n, s] = beta_in[b, s, n]
+                    g_tp[b, n, s] = g_in[b, s, n]
+                else:
+                    beta_tp[b, n, s] = T.float32(0)
+                    g_tp[b, n, s] = T.float32(0)
+
+            # ================================================================
+            # Step 3: Reshape into chunks and compute k_beta.
+            #         Logical reshape: (b, n, num_chunks*C, d) -> (b, n, num_chunks, C, d)
+            #         index mapping: s = c * C + t
+            # ================================================================
+            for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)):
+                out_query[b, n, c, t, d] = q_tp[b, n, c * T.int64(_C) + t, d]
+                out_key[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d]
+                k_beta_chunk[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d] * beta_tp[b, n, c * T.int64(_C) + t]
+
+            for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)):
+                out_value[b, n, c, t, d] = v_tp[b, n, c * T.int64(_C) + t, d]
+
+            # ================================================================
+            # Step 4: Upper triangular mask (static, chunk_size x chunk_size)
+            # ================================================================
+            for i, j in T.grid(T.int64(_C), T.int64(_C)):
+                out_mask[i, j] = T.Select(j >= i, 1, 0)
+
+            # ================================================================
+            # Step 5: Cumulative sum of g along chunk dim, then decay mask.
+            #         g_cumsum[b,n,c,t] = sum(g[b,n,c,0..t])
+            #         decay_mask[b,n,c,i,j] = exp(g_cumsum[i] - g_cumsum[j])
+            #                                 if j <= i, else 0
+            # ================================================================
+            # Cumsum: sequential along t within each (b, n, c)
+            # Use the same T.parallel + T.serial pattern as topi.cumsum
+            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
+                # Decompose flat index
+                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
+                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
+                c: T.int64 = bhc % num_chunks
+
+                g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
+                for t in T.serial(T.int64(_C) - T.int64(1)):
+                    g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
+
+            # Copy cumsum to output
+            for b, n, c, t in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)):
+                out_g_cumsum[b, n, c, t] = g_cumsum[b, n, c, t]
+
+            # Decay mask: lower triangular exp(g_cumsum[i] - g_cumsum[j])
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                if j <= i:
+                    out_decay_mask[b, n, c, i, j] = T.exp(g_cumsum[b, n, c, i] - g_cumsum[b, n, c, j])
+                else:
+                    out_decay_mask[b, n, c, i, j] = T.float32(0)
+
+            # ================================================================
+            # Step 6: Attention = -(k_beta @ key^T) * decay_mask, masked by
+            #         upper triangular (set diagonal and above to 0).
+            #         attn[b,h,c,i,j] = sum_d(k_beta[i,d] * key[j,d]) for d in key_dim
+            # ================================================================
+            # Matmul: k_beta @ key^T
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                attn_raw[b, n, c, i, j] = T.float32(0)
+            for b, n, c, i, j, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C), T.int64(_key_dim)):
+                attn_raw[b, n, c, i, j] = attn_raw[b, n, c, i, j] + k_beta_chunk[b, n, c, i, d] * out_key[b, n, c, j, d]
+
+            # Apply decay mask, zero upper triangle (mask[i,j]=1 when j>=i), negate
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                if j >= i:
+                    # Upper triangle including diagonal: set to 0
+                    attn_masked[b, n, c, i, j] = T.float32(0)
+                else:
+                    # Strictly lower triangle: -(attn * decay_mask)
+                    attn_masked[b, n, c, i, j] = -(attn_raw[b, n, c, i, j] * out_decay_mask[b, n, c, i, j])
+
+            # ================================================================
+            # Step 7: Associative prefix scan on attn_masked.
+            #
+            # PyTorch reference (sequential):
+            #   for i in range(1, chunk_size):
+            #       row = attn[..., i, :i].clone()
+            #       sub = attn[..., :i, :i].clone()
+            #       attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+            #
+            # Row i depends on the fully-updated rows 0..i-1.
+            # We parallelize over (batch, heads, chunks) and serialize over
+            # the row dimension i. For each row i, column j < i:
+            #   attn[i,j] += sum_{k=j+1}^{i-1} attn[i,k] * attn[k,j]
+            # where attn[k,j] must already be updated (k < i).
+            #
+            # Uses T.parallel + T.serial mirroring topi.cumsum pattern.
+            # ================================================================
+            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
+                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
+                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
+                c: T.int64 = bhc % num_chunks
+
+                # Row 0 is unchanged (no dependencies), copy it
+                for j in range(T.int64(_C)):
+                    out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
+
+                # Rows 1..chunk_size-1: sequential scan
+                for i in T.serial(T.int64(_C) - T.int64(1)):
+                    row: T.int64 = i + T.int64(1)
+
+                    # For j >= row (upper triangle + diagonal): copy directly
+                    for j in range(T.int64(_C) - row):
+                        out_attn[b, h, c, row, row + j] = attn_masked[b, h, c, row, row + j]
+
+                    # For j < row (lower triangle): apply prefix scan
+                    for j in range(row):
+                        # Initialize with original value, then accumulate in-place
+                        out_attn[b, h, c, row, j] = attn_masked[b, h, c, row, j]
+                        # Accumulate: sum over k in (j+1..row-1)
+                        # attn_masked[row, k] * out_attn[k, j]  (out_attn[k,j] already updated since k < row)
+                        for k in range(j + T.int64(1), row):
+                            out_attn[b, h, c, row, j] = out_attn[b, h, c, row, j] + attn_masked[b, h, c, row, k] * out_attn[b, h, c, k, j]
+
+        return chunk_gated_delta_rule
+    else:
+        @T.prim_func
+        def chunk_gated_delta_rule_no_norm(
+            var_query: T.handle,
+            var_key: T.handle,
+            var_value: T.handle,
+            var_g: T.handle,
+            var_beta: T.handle,
+            # Outputs
+            var_out_query: T.handle,
+            var_out_key: T.handle,
+            var_out_value: T.handle,
+            out_mask: T.Buffer((T.int64(_C), T.int64(_C)), "int32"),
+            var_out_g_cumsum: T.handle,
+            var_out_decay_mask: T.handle,
+            var_out_attn: T.handle,
+        ):
+            T.func_attr({"global_symbol": "chunk_gated_delta_rule", "tir.noalias": True})
+
+            # --- Symbolic shape variables ---
+            batch_size = T.int64()
+            seq_len = T.int64()
+            num_chunks = T.int64()
+
+            # --- Input buffers ---
+            query = T.match_buffer(var_query, (batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)), _dtype)
+            key = T.match_buffer(var_key, (batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)), _dtype)
+            value = T.match_buffer(var_value, (batch_size, seq_len, T.int64(_num_heads), T.int64(_val_dim)), _dtype)
+            g_in = T.match_buffer(var_g, (batch_size, seq_len, T.int64(_num_heads)), _dtype)
+            beta_in = T.match_buffer(var_beta, (batch_size, seq_len, T.int64(_num_heads)), _dtype)
+
+            # --- Output buffers ---
+            out_query = T.match_buffer(var_out_query, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            out_key = T.match_buffer(var_out_key, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            out_value = T.match_buffer(var_out_value, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)), _dtype)
+            out_g_cumsum = T.match_buffer(var_out_g_cumsum, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)), _dtype)
+            out_decay_mask = T.match_buffer(var_out_decay_mask, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+            out_attn = T.match_buffer(var_out_attn, (batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+
+            # --- Intermediate buffers ---
+            q_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)), _dtype)
+            k_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)), _dtype)
+            v_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)), _dtype)
+            beta_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)), _dtype)
+            g_tp = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)), _dtype)
+
+            g_cumsum = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)), _dtype)
+            k_beta_chunk = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)), _dtype)
+            attn_raw = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+            attn_masked = T.alloc_buffer((batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)), _dtype)
+
+            # ================================================================
+            # Step 1: Transpose (b,s,n,d) -> (b,n,s,d), scale query, pad
+            # ================================================================
+            for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)):
+                if s < seq_len:
+                    q_tp[b, n, s, d] = query[b, s, n, d] * T.float32(_scale)
+                    k_tp[b, n, s, d] = key[b, s, n, d]
+                else:
+                    q_tp[b, n, s, d] = T.float32(0)
+                    k_tp[b, n, s, d] = T.float32(0)
+
+            for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)):
+                if s < seq_len:
+                    v_tp[b, n, s, d] = value[b, s, n, d]
+                else:
+                    v_tp[b, n, s, d] = T.float32(0)
+
+            for b, n, s in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)):
+                if s < seq_len:
+                    beta_tp[b, n, s] = beta_in[b, s, n]
+                    g_tp[b, n, s] = g_in[b, s, n]
+                else:
+                    beta_tp[b, n, s] = T.float32(0)
+                    g_tp[b, n, s] = T.float32(0)
+
+            # ================================================================
+            # Step 2: Reshape into chunks, compute k_beta
+            # ================================================================
+            for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)):
+                out_query[b, n, c, t, d] = q_tp[b, n, c * T.int64(_C) + t, d]
+                out_key[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d]
+                k_beta_chunk[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d] * beta_tp[b, n, c * T.int64(_C) + t]
+
+            for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)):
+                out_value[b, n, c, t, d] = v_tp[b, n, c * T.int64(_C) + t, d]
+
+            # ================================================================
+            # Step 3: Upper triangular mask
+            # ================================================================
+            for i, j in T.grid(T.int64(_C), T.int64(_C)):
+                out_mask[i, j] = T.Select(j >= i, 1, 0)
+
+            # ================================================================
+            # Step 4: Cumsum of g, decay mask
+            # ================================================================
+            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
+                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
+                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
+                c: T.int64 = bhc % num_chunks
+
+                g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
+                for t in T.serial(T.int64(_C) - T.int64(1)):
+                    g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
+
+            for b, n, c, t in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)):
+                out_g_cumsum[b, n, c, t] = g_cumsum[b, n, c, t]
+
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                if j <= i:
+                    out_decay_mask[b, n, c, i, j] = T.exp(g_cumsum[b, n, c, i] - g_cumsum[b, n, c, j])
+                else:
+                    out_decay_mask[b, n, c, i, j] = T.float32(0)
+
+            # ================================================================
+            # Step 5: Attention matmul + mask + negate
+            # ================================================================
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                attn_raw[b, n, c, i, j] = T.float32(0)
+            for b, n, c, i, j, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C), T.int64(_key_dim)):
+                attn_raw[b, n, c, i, j] = attn_raw[b, n, c, i, j] + k_beta_chunk[b, n, c, i, d] * out_key[b, n, c, j, d]
+
+            for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
+                if j >= i:
+                    attn_masked[b, n, c, i, j] = T.float32(0)
+                else:
+                    attn_masked[b, n, c, i, j] = -(attn_raw[b, n, c, i, j] * out_decay_mask[b, n, c, i, j])
+
+            # ================================================================
+            # Step 6: Prefix scan (see L2 norm variant for detailed comments)
+            # ================================================================
+            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
+                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
+                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
+                c: T.int64 = bhc % num_chunks
+
+                for j in range(T.int64(_C)):
+                    out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
+
+                for i in T.serial(T.int64(_C) - T.int64(1)):
+                    row: T.int64 = i + T.int64(1)
+
+                    for j in range(T.int64(_C) - row):
+                        out_attn[b, h, c, row, row + j] = attn_masked[b, h, c, row, row + j]
+
+                    for j in range(row):
+                        out_attn[b, h, c, row, j] = attn_masked[b, h, c, row, j]
+                        for k in range(j + T.int64(1), row):
+                            out_attn[b, h, c, row, j] = out_attn[b, h, c, row, j] + attn_masked[b, h, c, row, k] * out_attn[b, h, c, k, j]
+
+        return chunk_gated_delta_rule_no_norm
 
 
 def _chunk_recurrent_gated_delta_rule():
