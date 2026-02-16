@@ -276,11 +276,20 @@ def _chunk_gated_delta_rule(
             # ================================================================
             # Compute sum of squares per (batch, seq, head)
             for b, s, n in T.grid(batch_size, seq_len, T.int64(_num_heads)):
-                q_norm_sq_sum[b, s, n] = T.float32(0)
-                k_norm_sq_sum[b, s, n] = T.float32(0)
+                with T.sblock("q_norm_init"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vs = T.axis.spatial(seq_len, s)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    q_norm_sq_sum[vb, vs, vn] = T.float32(0)
+                    k_norm_sq_sum[vb, vs, vn] = T.float32(0)
             for b, s, n, d in T.grid(batch_size, seq_len, T.int64(_num_heads), T.int64(_key_dim)):
-                q_norm_sq_sum[b, s, n] = q_norm_sq_sum[b, s, n] + query[b, s, n, d] * query[b, s, n, d]
-                k_norm_sq_sum[b, s, n] = k_norm_sq_sum[b, s, n] + key[b, s, n, d] * key[b, s, n, d]
+                with T.sblock("q_norm_update"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vs = T.axis.spatial(seq_len, s)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vd = T.axis.reduce(T.int64(_key_dim), d)
+                    q_norm_sq_sum[vb, vs, vn] = q_norm_sq_sum[vb, vs, vn] + query[vb, vs, vn, vd] * query[vb, vs, vn, vd]
+                    k_norm_sq_sum[vb, vs, vn] = k_norm_sq_sum[vb, vs, vn] + key[vb, vs, vn, vd] * key[vb, vs, vn, vd]
 
             # ================================================================
             # Step 2: Transpose (b,s,n,d) -> (b,n,s,d), apply L2 norm, scale
@@ -288,26 +297,40 @@ def _chunk_gated_delta_rule(
             #         beta and g from (b,s,n) -> (b,n,s).
             # ================================================================
             for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)):
-                if s < seq_len:
-                    q_tp[b, n, s, d] = query[b, s, n, d] * T.rsqrt(q_norm_sq_sum[b, s, n] + T.float32(_eps)) * T.float32(_scale)
-                    k_tp[b, n, s, d] = key[b, s, n, d] * T.rsqrt(k_norm_sq_sum[b, s, n] + T.float32(_eps))
-                else:
-                    q_tp[b, n, s, d] = T.float32(0)
-                    k_tp[b, n, s, d] = T.float32(0)
+                with T.sblock("transpose_qk"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    vd = T.axis.spatial(T.int64(_key_dim), d)
+                    if vs < seq_len:
+                        q_tp[vb, vn, vs, vd] = query[vb, vs, vn, vd] * T.rsqrt(q_norm_sq_sum[vb, vs, vn] + T.float32(_eps)) * T.float32(_scale)
+                        k_tp[vb, vn, vs, vd] = key[vb, vs, vn, vd] * T.rsqrt(k_norm_sq_sum[vb, vs, vn] + T.float32(_eps))
+                    else:
+                        q_tp[vb, vn, vs, vd] = T.float32(0)
+                        k_tp[vb, vn, vs, vd] = T.float32(0)
 
             for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)):
-                if s < seq_len:
-                    v_tp[b, n, s, d] = value[b, s, n, d]
-                else:
-                    v_tp[b, n, s, d] = T.float32(0)
+                with T.sblock("transpose_v"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    vd = T.axis.spatial(T.int64(_val_dim), d)
+                    if vs < seq_len:
+                        v_tp[vb, vn, vs, vd] = value[vb, vs, vn, vd]
+                    else:
+                        v_tp[vb, vn, vs, vd] = T.float32(0)
 
             for b, n, s in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)):
-                if s < seq_len:
-                    beta_tp[b, n, s] = beta_in[b, s, n]
-                    g_tp[b, n, s] = g_in[b, s, n]
-                else:
-                    beta_tp[b, n, s] = T.float32(0)
-                    g_tp[b, n, s] = T.float32(0)
+                with T.sblock("transpose_beta_g"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    if vs < seq_len:
+                        beta_tp[vb, vn, vs] = beta_in[vb, vs, vn]
+                        g_tp[vb, vn, vs] = g_in[vb, vs, vn]
+                    else:
+                        beta_tp[vb, vn, vs] = T.float32(0)
+                        g_tp[vb, vn, vs] = T.float32(0)
 
             # ================================================================
             # Step 3: Reshape into chunks and compute k_beta.
@@ -315,18 +338,33 @@ def _chunk_gated_delta_rule(
             #         index mapping: s = c * C + t
             # ================================================================
             for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)):
-                out_query[b, n, c, t, d] = q_tp[b, n, c * T.int64(_C) + t, d]
-                out_key[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d]
-                k_beta_chunk[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d] * beta_tp[b, n, c * T.int64(_C) + t]
+                with T.sblock("reshape_qk_kbeta"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    vd = T.axis.spatial(T.int64(_key_dim), d)
+                    out_query[vb, vn, vc, vt, vd] = q_tp[vb, vn, vc * T.int64(_C) + vt, vd]
+                    out_key[vb, vn, vc, vt, vd] = k_tp[vb, vn, vc * T.int64(_C) + vt, vd]
+                    k_beta_chunk[vb, vn, vc, vt, vd] = k_tp[vb, vn, vc * T.int64(_C) + vt, vd] * beta_tp[vb, vn, vc * T.int64(_C) + vt]
 
             for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)):
-                out_value[b, n, c, t, d] = v_tp[b, n, c * T.int64(_C) + t, d]
+                with T.sblock("reshape_v"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    vd = T.axis.spatial(T.int64(_val_dim), d)
+                    out_value[vb, vn, vc, vt, vd] = v_tp[vb, vn, vc * T.int64(_C) + vt, vd]
 
             # ================================================================
             # Step 4: Upper triangular mask (static, chunk_size x chunk_size)
             # ================================================================
             for i, j in T.grid(T.int64(_C), T.int64(_C)):
-                out_mask[i, j] = T.Select(j >= i, 1, 0)
+                with T.sblock("upper_tri_mask"):
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    out_mask[vi, vj] = T.Select(vj >= vi, 1, 0)
 
             # ================================================================
             # Step 5: Cumulative sum of g along chunk dim, then decay mask.
@@ -336,20 +374,35 @@ def _chunk_gated_delta_rule(
             # ================================================================
             # Cumsum: sequential along t within each (b, n, c)
             for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
-                g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
-                for t in range(T.int64(_C) - T.int64(1)):
-                    g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
+                with T.sblock("g_cumsum"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vh = T.axis.spatial(T.int64(_num_heads), h)
+                    vc = T.axis.spatial(num_chunks, c)
+                    g_cumsum[vb, vh, vc, T.int64(0)] = g_tp[vb, vh, vc * T.int64(_C)]
+                    for t in range(T.int64(_C) - T.int64(1)):
+                        g_cumsum[vb, vh, vc, t + T.int64(1)] = g_cumsum[vb, vh, vc, t] + g_tp[vb, vh, vc * T.int64(_C) + t + T.int64(1)]
 
             # Copy cumsum to output
             for b, n, c, t in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)):
-                out_g_cumsum[b, n, c, t] = g_cumsum[b, n, c, t]
+                with T.sblock("g_cumsum_copy"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    out_g_cumsum[vb, vn, vc, vt] = g_cumsum[vb, vn, vc, vt]
 
             # Decay mask: lower triangular exp(g_cumsum[i] - g_cumsum[j])
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                if j <= i:
-                    out_decay_mask[b, n, c, i, j] = T.exp(g_cumsum[b, n, c, i] - g_cumsum[b, n, c, j])
-                else:
-                    out_decay_mask[b, n, c, i, j] = T.float32(0)
+                with T.sblock("decay_mask"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    if vj <= vi:
+                        out_decay_mask[vb, vn, vc, vi, vj] = T.exp(g_cumsum[vb, vn, vc, vi] - g_cumsum[vb, vn, vc, vj])
+                    else:
+                        out_decay_mask[vb, vn, vc, vi, vj] = T.float32(0)
 
             # ================================================================
             # Step 6: Attention = -(k_beta @ key^T) * decay_mask, masked by
@@ -358,18 +411,35 @@ def _chunk_gated_delta_rule(
             # ================================================================
             # Matmul: k_beta @ key^T
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                attn_raw[b, n, c, i, j] = T.float32(0)
+                with T.sblock("attn_mm_init"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    attn_raw[vb, vn, vc, vi, vj] = T.float32(0)
             for b, n, c, i, j, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C), T.int64(_key_dim)):
-                attn_raw[b, n, c, i, j] = attn_raw[b, n, c, i, j] + k_beta_chunk[b, n, c, i, d] * out_key[b, n, c, j, d]
+                with T.sblock("attn_mm_update"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    vd = T.axis.reduce(T.int64(_key_dim), d)
+                    attn_raw[vb, vn, vc, vi, vj] = attn_raw[vb, vn, vc, vi, vj] + k_beta_chunk[vb, vn, vc, vi, vd] * out_key[vb, vn, vc, vj, vd]
 
             # Apply decay mask, zero upper triangle (mask[i,j]=1 when j>=i), negate
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                if j >= i:
-                    # Upper triangle including diagonal: set to 0
-                    attn_masked[b, n, c, i, j] = T.float32(0)
-                else:
-                    # Strictly lower triangle: -(attn * decay_mask)
-                    attn_masked[b, n, c, i, j] = -(attn_raw[b, n, c, i, j] * out_decay_mask[b, n, c, i, j])
+                with T.sblock("attn_mask_negate"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    if vj >= vi:
+                        attn_masked[vb, vn, vc, vi, vj] = T.float32(0)
+                    else:
+                        attn_masked[vb, vn, vc, vi, vj] = -(attn_raw[vb, vn, vc, vi, vj] * out_decay_mask[vb, vn, vc, vi, vj])
 
             # ================================================================
             # Step 7: Associative prefix scan on attn_masked.
@@ -386,29 +456,29 @@ def _chunk_gated_delta_rule(
             #   attn[i,j] += sum_{k=j+1}^{i-1} attn[i,k] * attn[k,j]
             # where attn[k,j] must already be updated (k < i).
             #
-            # Uses T.grid for independent dims, range() for sequential scan.
+            # Outer (b,h,c) are spatial axes in a T.sblock so dlight can
+            # bind them to GPU threads. The inner scan is sequential range().
             # ================================================================
             for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
-                # Row 0 is unchanged (no dependencies), copy it
-                for j in range(T.int64(_C)):
-                    out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
+                with T.sblock("prefix_scan"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vh = T.axis.spatial(T.int64(_num_heads), h)
+                    vc = T.axis.spatial(num_chunks, c)
+                    # Row 0 is unchanged (no dependencies), copy it
+                    for j in range(T.int64(_C)):
+                        out_attn[vb, vh, vc, T.int64(0), j] = attn_masked[vb, vh, vc, T.int64(0), j]
 
-                # Rows 1..chunk_size-1: sequential scan
-                for i in range(T.int64(_C) - T.int64(1)):
-                    row: T.int64 = i + T.int64(1)
+                    # Rows 1..chunk_size-1: sequential scan
+                    for i in range(T.int64(_C) - T.int64(1)):
+                        # For j >= i+1 (upper triangle + diagonal): copy directly
+                        for j in range(T.int64(_C) - (i + T.int64(1))):
+                            out_attn[vb, vh, vc, i + T.int64(1), i + T.int64(1) + j] = attn_masked[vb, vh, vc, i + T.int64(1), i + T.int64(1) + j]
 
-                    # For j >= row (upper triangle + diagonal): copy directly
-                    for j in range(T.int64(_C) - row):
-                        out_attn[b, h, c, row, row + j] = attn_masked[b, h, c, row, row + j]
-
-                    # For j < row (lower triangle): apply prefix scan
-                    for j in range(row):
-                        # Initialize with original value, then accumulate in-place
-                        out_attn[b, h, c, row, j] = attn_masked[b, h, c, row, j]
-                        # Accumulate: sum over k in (j+1..row-1)
-                        # attn_masked[row, k] * out_attn[k, j]  (out_attn[k,j] already updated since k < row)
-                        for k in range(j + T.int64(1), row):
-                            out_attn[b, h, c, row, j] = out_attn[b, h, c, row, j] + attn_masked[b, h, c, row, k] * out_attn[b, h, c, k, j]
+                        # For j < i+1 (lower triangle): apply prefix scan
+                        for j in range(i + T.int64(1)):
+                            out_attn[vb, vh, vc, i + T.int64(1), j] = attn_masked[vb, vh, vc, i + T.int64(1), j]
+                            for k in range(j + T.int64(1), i + T.int64(1)):
+                                out_attn[vb, vh, vc, i + T.int64(1), j] = out_attn[vb, vh, vc, i + T.int64(1), j] + attn_masked[vb, vh, vc, i + T.int64(1), k] * out_attn[vb, vh, vc, k, j]
 
         return chunk_gated_delta_rule
     else:
@@ -466,92 +536,157 @@ def _chunk_gated_delta_rule(
             # Step 1: Transpose (b,s,n,d) -> (b,n,s,d), scale query, pad
             # ================================================================
             for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_key_dim)):
-                if s < seq_len:
-                    q_tp[b, n, s, d] = query[b, s, n, d] * T.float32(_scale)
-                    k_tp[b, n, s, d] = key[b, s, n, d]
-                else:
-                    q_tp[b, n, s, d] = T.float32(0)
-                    k_tp[b, n, s, d] = T.float32(0)
+                with T.sblock("transpose_qk"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    vd = T.axis.spatial(T.int64(_key_dim), d)
+                    if vs < seq_len:
+                        q_tp[vb, vn, vs, vd] = query[vb, vs, vn, vd] * T.float32(_scale)
+                        k_tp[vb, vn, vs, vd] = key[vb, vs, vn, vd]
+                    else:
+                        q_tp[vb, vn, vs, vd] = T.float32(0)
+                        k_tp[vb, vn, vs, vd] = T.float32(0)
 
             for b, n, s, d in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C), T.int64(_val_dim)):
-                if s < seq_len:
-                    v_tp[b, n, s, d] = value[b, s, n, d]
-                else:
-                    v_tp[b, n, s, d] = T.float32(0)
+                with T.sblock("transpose_v"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    vd = T.axis.spatial(T.int64(_val_dim), d)
+                    if vs < seq_len:
+                        v_tp[vb, vn, vs, vd] = value[vb, vs, vn, vd]
+                    else:
+                        v_tp[vb, vn, vs, vd] = T.float32(0)
 
             for b, n, s in T.grid(batch_size, T.int64(_num_heads), num_chunks * T.int64(_C)):
-                if s < seq_len:
-                    beta_tp[b, n, s] = beta_in[b, s, n]
-                    g_tp[b, n, s] = g_in[b, s, n]
-                else:
-                    beta_tp[b, n, s] = T.float32(0)
-                    g_tp[b, n, s] = T.float32(0)
+                with T.sblock("transpose_beta_g"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vs = T.axis.spatial(num_chunks * T.int64(_C), s)
+                    if vs < seq_len:
+                        beta_tp[vb, vn, vs] = beta_in[vb, vs, vn]
+                        g_tp[vb, vn, vs] = g_in[vb, vs, vn]
+                    else:
+                        beta_tp[vb, vn, vs] = T.float32(0)
+                        g_tp[vb, vn, vs] = T.float32(0)
 
             # ================================================================
             # Step 2: Reshape into chunks, compute k_beta
             # ================================================================
             for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_key_dim)):
-                out_query[b, n, c, t, d] = q_tp[b, n, c * T.int64(_C) + t, d]
-                out_key[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d]
-                k_beta_chunk[b, n, c, t, d] = k_tp[b, n, c * T.int64(_C) + t, d] * beta_tp[b, n, c * T.int64(_C) + t]
+                with T.sblock("reshape_qk_kbeta"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    vd = T.axis.spatial(T.int64(_key_dim), d)
+                    out_query[vb, vn, vc, vt, vd] = q_tp[vb, vn, vc * T.int64(_C) + vt, vd]
+                    out_key[vb, vn, vc, vt, vd] = k_tp[vb, vn, vc * T.int64(_C) + vt, vd]
+                    k_beta_chunk[vb, vn, vc, vt, vd] = k_tp[vb, vn, vc * T.int64(_C) + vt, vd] * beta_tp[vb, vn, vc * T.int64(_C) + vt]
 
             for b, n, c, t, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_val_dim)):
-                out_value[b, n, c, t, d] = v_tp[b, n, c * T.int64(_C) + t, d]
+                with T.sblock("reshape_v"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    vd = T.axis.spatial(T.int64(_val_dim), d)
+                    out_value[vb, vn, vc, vt, vd] = v_tp[vb, vn, vc * T.int64(_C) + vt, vd]
 
             # ================================================================
             # Step 3: Upper triangular mask
             # ================================================================
             for i, j in T.grid(T.int64(_C), T.int64(_C)):
-                out_mask[i, j] = T.Select(j >= i, 1, 0)
+                with T.sblock("upper_tri_mask"):
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    out_mask[vi, vj] = T.Select(vj >= vi, 1, 0)
 
             # ================================================================
             # Step 4: Cumsum of g, decay mask
             # ================================================================
             for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
-                g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
-                for t in range(T.int64(_C) - T.int64(1)):
-                    g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
+                with T.sblock("g_cumsum"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vh = T.axis.spatial(T.int64(_num_heads), h)
+                    vc = T.axis.spatial(num_chunks, c)
+                    g_cumsum[vb, vh, vc, T.int64(0)] = g_tp[vb, vh, vc * T.int64(_C)]
+                    for t in range(T.int64(_C) - T.int64(1)):
+                        g_cumsum[vb, vh, vc, t + T.int64(1)] = g_cumsum[vb, vh, vc, t] + g_tp[vb, vh, vc * T.int64(_C) + t + T.int64(1)]
 
             for b, n, c, t in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)):
-                out_g_cumsum[b, n, c, t] = g_cumsum[b, n, c, t]
+                with T.sblock("g_cumsum_copy"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vt = T.axis.spatial(T.int64(_C), t)
+                    out_g_cumsum[vb, vn, vc, vt] = g_cumsum[vb, vn, vc, vt]
 
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                if j <= i:
-                    out_decay_mask[b, n, c, i, j] = T.exp(g_cumsum[b, n, c, i] - g_cumsum[b, n, c, j])
-                else:
-                    out_decay_mask[b, n, c, i, j] = T.float32(0)
+                with T.sblock("decay_mask"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    if vj <= vi:
+                        out_decay_mask[vb, vn, vc, vi, vj] = T.exp(g_cumsum[vb, vn, vc, vi] - g_cumsum[vb, vn, vc, vj])
+                    else:
+                        out_decay_mask[vb, vn, vc, vi, vj] = T.float32(0)
 
             # ================================================================
             # Step 5: Attention matmul + mask + negate
             # ================================================================
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                attn_raw[b, n, c, i, j] = T.float32(0)
+                with T.sblock("attn_mm_init"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    attn_raw[vb, vn, vc, vi, vj] = T.float32(0)
             for b, n, c, i, j, d in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C), T.int64(_key_dim)):
-                attn_raw[b, n, c, i, j] = attn_raw[b, n, c, i, j] + k_beta_chunk[b, n, c, i, d] * out_key[b, n, c, j, d]
+                with T.sblock("attn_mm_update"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    vd = T.axis.reduce(T.int64(_key_dim), d)
+                    attn_raw[vb, vn, vc, vi, vj] = attn_raw[vb, vn, vc, vi, vj] + k_beta_chunk[vb, vn, vc, vi, vd] * out_key[vb, vn, vc, vj, vd]
 
             for b, n, c, i, j in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C), T.int64(_C)):
-                if j >= i:
-                    attn_masked[b, n, c, i, j] = T.float32(0)
-                else:
-                    attn_masked[b, n, c, i, j] = -(attn_raw[b, n, c, i, j] * out_decay_mask[b, n, c, i, j])
+                with T.sblock("attn_mask_negate"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vn = T.axis.spatial(T.int64(_num_heads), n)
+                    vc = T.axis.spatial(num_chunks, c)
+                    vi = T.axis.spatial(T.int64(_C), i)
+                    vj = T.axis.spatial(T.int64(_C), j)
+                    if vj >= vi:
+                        attn_masked[vb, vn, vc, vi, vj] = T.float32(0)
+                    else:
+                        attn_masked[vb, vn, vc, vi, vj] = -(attn_raw[vb, vn, vc, vi, vj] * out_decay_mask[vb, vn, vc, vi, vj])
 
             # ================================================================
             # Step 6: Prefix scan (see L2 norm variant for detailed comments)
             # ================================================================
             for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
-                for j in range(T.int64(_C)):
-                    out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
+                with T.sblock("prefix_scan"):
+                    vb = T.axis.spatial(batch_size, b)
+                    vh = T.axis.spatial(T.int64(_num_heads), h)
+                    vc = T.axis.spatial(num_chunks, c)
+                    for j in range(T.int64(_C)):
+                        out_attn[vb, vh, vc, T.int64(0), j] = attn_masked[vb, vh, vc, T.int64(0), j]
 
-                for i in range(T.int64(_C) - T.int64(1)):
-                    row: T.int64 = i + T.int64(1)
+                    for i in range(T.int64(_C) - T.int64(1)):
+                        for j in range(T.int64(_C) - (i + T.int64(1))):
+                            out_attn[vb, vh, vc, i + T.int64(1), i + T.int64(1) + j] = attn_masked[vb, vh, vc, i + T.int64(1), i + T.int64(1) + j]
 
-                    for j in range(T.int64(_C) - row):
-                        out_attn[b, h, c, row, row + j] = attn_masked[b, h, c, row, row + j]
-
-                    for j in range(row):
-                        out_attn[b, h, c, row, j] = attn_masked[b, h, c, row, j]
-                        for k in range(j + T.int64(1), row):
-                            out_attn[b, h, c, row, j] = out_attn[b, h, c, row, j] + attn_masked[b, h, c, row, k] * out_attn[b, h, c, k, j]
+                        for j in range(i + T.int64(1)):
+                            out_attn[vb, vh, vc, i + T.int64(1), j] = attn_masked[vb, vh, vc, i + T.int64(1), j]
+                            for k in range(j + T.int64(1), i + T.int64(1)):
+                                out_attn[vb, vh, vc, i + T.int64(1), j] = out_attn[vb, vh, vc, i + T.int64(1), j] + attn_masked[vb, vh, vc, i + T.int64(1), k] * out_attn[vb, vh, vc, k, j]
 
         return chunk_gated_delta_rule_no_norm
 
@@ -574,9 +709,9 @@ mod = tvm.IRModule(
                 "chunk_gated_delta_l2_norm": _chunk_gated_delta_rule(
                     32, 128, 16, 128, use_qk_l2norm_in_kernel=True
                 ),
-        #        "chunk_gated_delta": _chunk_gated_delta_rule(
-        #            32, 128, 16, 128, use_qk_l2norm_in_kernel=False
-        #        ),
+                "chunk_gated_delta": _chunk_gated_delta_rule(
+                    32, 128, 16, 128, use_qk_l2norm_in_kernel=False
+                ),
     }
 )
 
