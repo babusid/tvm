@@ -191,11 +191,11 @@ def _chunk_gated_delta_rule(
     compiled away to a no-op.
 
     Strategy for prefix scan:
-      - Fuse (batch, heads, chunks) into a single T.parallel loop
-      - Use T.serial for the row loop (i) and bare range loops for (j, k)
-      - This mirrors the pattern used by topi.cumsum (scan.py) which TVM
-        correctly lowers: T.parallel for independent dims, T.serial for
-        the sequential scan dimension.
+      - Use T.grid(batch, heads, chunks) for independent dimensions
+      - Use bare range() loops for the sequential row scan (i) and inner (j, k)
+      - Accumulate directly into output buffer locations to avoid the
+        local-variable-mutation bug (where TVMScript creates new let-bindings
+        instead of mutating).
 
     Reference: qwen3_gdn.py torch_chunk_gated_delta_rule lines 146-263
     """
@@ -335,15 +335,9 @@ def _chunk_gated_delta_rule(
             #                                 if j <= i, else 0
             # ================================================================
             # Cumsum: sequential along t within each (b, n, c)
-            # Use the same T.parallel + T.serial pattern as topi.cumsum
-            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
-                # Decompose flat index
-                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
-                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
-                c: T.int64 = bhc % num_chunks
-
+            for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
                 g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
-                for t in T.serial(T.int64(_C) - T.int64(1)):
+                for t in range(T.int64(_C) - T.int64(1)):
                     g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
 
             # Copy cumsum to output
@@ -392,19 +386,15 @@ def _chunk_gated_delta_rule(
             #   attn[i,j] += sum_{k=j+1}^{i-1} attn[i,k] * attn[k,j]
             # where attn[k,j] must already be updated (k < i).
             #
-            # Uses T.parallel + T.serial mirroring topi.cumsum pattern.
+            # Uses T.grid for independent dims, range() for sequential scan.
             # ================================================================
-            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
-                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
-                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
-                c: T.int64 = bhc % num_chunks
-
+            for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
                 # Row 0 is unchanged (no dependencies), copy it
                 for j in range(T.int64(_C)):
                     out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
 
                 # Rows 1..chunk_size-1: sequential scan
-                for i in T.serial(T.int64(_C) - T.int64(1)):
+                for i in range(T.int64(_C) - T.int64(1)):
                     row: T.int64 = i + T.int64(1)
 
                     # For j >= row (upper triangle + diagonal): copy directly
@@ -517,13 +507,9 @@ def _chunk_gated_delta_rule(
             # ================================================================
             # Step 4: Cumsum of g, decay mask
             # ================================================================
-            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
-                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
-                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
-                c: T.int64 = bhc % num_chunks
-
+            for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
                 g_cumsum[b, h, c, T.int64(0)] = g_tp[b, h, c * T.int64(_C)]
-                for t in T.serial(T.int64(_C) - T.int64(1)):
+                for t in range(T.int64(_C) - T.int64(1)):
                     g_cumsum[b, h, c, t + T.int64(1)] = g_cumsum[b, h, c, t] + g_tp[b, h, c * T.int64(_C) + t + T.int64(1)]
 
             for b, n, c, t in T.grid(batch_size, T.int64(_num_heads), num_chunks, T.int64(_C)):
@@ -552,15 +538,11 @@ def _chunk_gated_delta_rule(
             # ================================================================
             # Step 6: Prefix scan (see L2 norm variant for detailed comments)
             # ================================================================
-            for bhc in T.parallel(batch_size * T.int64(_num_heads) * num_chunks):
-                b: T.int64 = bhc // (T.int64(_num_heads) * num_chunks)
-                h: T.int64 = bhc % (T.int64(_num_heads) * num_chunks) // num_chunks
-                c: T.int64 = bhc % num_chunks
-
+            for b, h, c in T.grid(batch_size, T.int64(_num_heads), num_chunks):
                 for j in range(T.int64(_C)):
                     out_attn[b, h, c, T.int64(0), j] = attn_masked[b, h, c, T.int64(0), j]
 
-                for i in T.serial(T.int64(_C) - T.int64(1)):
+                for i in range(T.int64(_C) - T.int64(1)):
                     row: T.int64 = i + T.int64(1)
 
                     for j in range(T.int64(_C) - row):
