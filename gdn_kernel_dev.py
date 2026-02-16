@@ -61,40 +61,44 @@ def _gen_causal_conv1d_update(
         conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
 
         # Step 1: Concatenate conv_state and hidden_states along last dimension
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len):
-            if l < T.int64(_state_len):
-                hidden_states_new[b, h, l] = conv_state_buf[b, h, l]
-            else:
-                hidden_states_new[b, h, l] = hidden_states_buf[b, h, l - T.int64(_state_len)]
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+            with T.sblock("copy_conv_state_to_total_hidden_state"):
+                vb, vh, vl = T.axis.remap("SSS", [b,h,l])
+                hidden_states_new[vb,vh,vl] = conv_state_buf[vb,vh,vl]
+
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            with T.sblock("copy_new_hidden_state_to_total_hidden_state"):
+                vb, vh, vl = T.axis.remap("SSS", [b,h,l])
+                hidden_states_new[vb,vh,vl + T.int64(_state_len)] = hidden_states_buf[vb,vh,vl]
 
         # Step 2: Extract last state_len elements as next_conv_state
         for b, h, s in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
-            next_conv_state_buf[b, h, s] = hidden_states_new[b, h, s + seq_len]
+            with T.sblock("create_next_conv_state"):
+                vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                next_conv_state_buf[vb, vh, vs] = hidden_states_new[vb, vh, vs + seq_len]
 
-        # Step 3: Initialize conv_sum to 0
-        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
-            conv_sum[b, h, s] = T.cast(T.float32(0.0), _dtype)
-
-        # Step 4: Compute causal convolution (sliding window)
+        # Step 3: Compute causal convolution (sliding window)
         # For each position s in output, convolve with state_len window ending at s+state_len
         for b, h, s, kw in T.grid(batch_size, T.int64(_hidden_size), seq_len, T.int64(_state_len)):
-            conv_sum[b, h, s] = (
-                conv_sum[b, h, s]
-                + hidden_states_new[b, h, s + kw + T.int64(1)] * weight[h, T.int64(0), kw]
-            )
+            with T.sblock("compute_causal_conv"):
+                vb, vh, vs, vkw = T.axis.remap("SSSR", [b,h,s,kw])
+                with T.init():
+                    conv_sum[vb, vh, vs] = T.float32(0.0)
+                conv_sum[vb, vh, vs] += hidden_states_new[vb, vh, vs + vkw + T.int64(1)] * weight[vh, T.int64(0), vkw]
 
-        # Step 5: Add bias and apply activation
-        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
-            # Add bias
-            biased_val = conv_sum[b, h, s] + bias[h]
-
-            # Apply activation if enabled (closure constant)
-            if _activation == "silu":
-                # SiLU(x) = x * sigmoid(x)
-                val_float = T.cast(biased_val, "float32")
-                out_buf[b, h, s] = T.cast(val_float * T.sigmoid(val_float), _dtype)
-            else:
-                out_buf[b, h, s] = biased_val
+        # Step 4: Add bias and apply activation
+        if _activation == 'silu':
+            for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+                with T.sblock("apply_bias_activation_and_writeback"):
+                    vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                    biased_val = conv_sum[vb, vh, vs] + bias[vh]
+                    val_float = T.cast(biased_val, "float32")
+                    out_buf[vb, vh, vs] = T.cast(val_float * T.sigmoid(val_float), _dtype)
+        else:
+            for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+                with T.sblock("apply_bias_and_writeback"):
+                    vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                    out_buf[vb, vh, vs] = conv_sum[vb, vh, vs] + bias[vh]
 
        
     @T.prim_func
@@ -128,41 +132,49 @@ def _gen_causal_conv1d_update(
             (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len), dtype=_dtype
         )
         conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
-
+        
         # Step 1: Concatenate conv_state and hidden_states along last dimension
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len):
-            if l < T.int64(_state_len):
-                hidden_states_new[b, h, l] = conv_state_buf[b, h, l]
-            else:
-                hidden_states_new[b, h, l] = hidden_states_buf[b, h, l - T.int64(_state_len)]
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+            with T.sblock("copy_conv_state_to_total_hidden_state"):
+                vb, vh, vl = T.axis.remap("SSS", [b,h,l])
+                hidden_states_new[vb,vh,vl] = conv_state_buf[vb,vh,vl]
+
+        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+            with T.sblock("copy_new_hidden_state_to_total_hidden_state"):
+                vb, vh, vl = T.axis.remap("SSS", [b,h,l])
+                hidden_states_new[vb,vh,vl + T.int64(_state_len)] = hidden_states_buf[vb,vh,vl]
 
         # Step 2: Extract last state_len elements as next_conv_state
         for b, h, s in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
-            next_conv_state_buf[b, h, s] = hidden_states_new[b, h, s + seq_len]
+            with T.sblock("create_next_conv_state"):
+                vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                next_conv_state_buf[vb, vh, vs] = hidden_states_new[vb, vh, vs + seq_len]
 
-        # Step 3: Initialize conv_sum to 0
-        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
-            conv_sum[b, h, s] = T.cast(T.float32(0.0), _dtype)
-
-        # Step 4: Compute causal convolution (sliding window)
+        # Step 3: Compute causal convolution (sliding window)
         # For each position s in output, convolve with state_len window ending at s+state_len
         for b, h, s, kw in T.grid(batch_size, T.int64(_hidden_size), seq_len, T.int64(_state_len)):
-            conv_sum[b, h, s] = (
-                conv_sum[b, h, s]
-                + hidden_states_new[b, h, s + kw + T.int64(1)] * weight[h, T.int64(0), kw]
-            )
+            with T.sblock("compute_causal_conv"):
+                vb, vh, vs, vkw = T.axis.remap("SSSR", [b,h,s,kw])
+                with T.init():
+                    conv_sum[vb, vh, vs] = T.float32(0.0)
+                conv_sum[vb, vh, vs] += hidden_states_new[vb, vh, vs + vkw + T.int64(1)] * weight[vh, T.int64(0), vkw]
 
         # Step 5: Apply activation (no bias)
-        for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
-            val = conv_sum[b, h, s]
-
-            # Apply activation if enabled (closure constant)
-            if _activation == "silu":
-                # SiLU(x) = x * sigmoid(x)
-                val_float = T.cast(val, "float32")
-                out_buf[b, h, s] = T.cast(val_float * T.sigmoid(val_float), _dtype)
-            else:
-                out_buf[b, h, s] = val
+        if _activation == 'silu':
+            for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+                with T.sblock("apply_activation_and_writeback"):
+                    vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                    val = conv_sum[vb, vh, vs]
+                    # Apply activation if enabled
+                    # SiLU(x) = x * sigmoid(x)
+                    val_float = T.cast(val, "float32")
+                    out_buf[vb, vh, vs] = T.cast(val_float * T.sigmoid(val_float), _dtype)
+        else:
+            for b, h, s in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+                with T.sblock("writeback"):
+                    vb, vh, vs = T.axis.remap("SSS", [b,h,s])
+                    val = conv_sum[vb, vh, vs]
+                    out_buf[vb, vh, vs] = val
 
     if has_bias:
         return causal_conv1d_update_with_bias
@@ -383,14 +395,16 @@ def _chunk_recurrent_gated_delta_rule():
 
 mod = tvm.IRModule(
     {
-        #"conv1d_biased": _gen_causal_conv1d_update(128, 128, has_bias=True),
-        #"conv1d_nobias": _gen_causal_conv1d_update(128, 128, has_bias=False),
-                "chunk_gated_delta_l2_norm": _chunk_gated_delta_rule(
-                    32, 128, 16, 128, use_qk_l2norm_in_kernel=True
-                ),
-        #        "chunk_gated_delta": _chunk_gated_delta_rule(
-        #            32, 128, 16, 128, use_qk_l2norm_in_kernel=False
-        #        ),
+        #"conv1d_biased_act": _gen_causal_conv1d_update(128, 128, has_bias=True),
+        #"conv1d_biased": _gen_causal_conv1d_update(128, 128, has_bias=True, activation=None),
+        "conv1d_nobias_act": _gen_causal_conv1d_update(128, 128, has_bias=False),
+        #"conv1d_nobias": _gen_causal_conv1d_update(128, 128, has_bias=False, activation=None),
+        #"chunk_gated_delta_l2_norm": _chunk_gated_delta_rule(
+        #           32, 128, 16, 128, use_qk_l2norm_in_kernel=True
+        #       ),
+        #       "chunk_gated_delta": _chunk_gated_delta_rule(
+        #           32, 128, 16, 128, use_qk_l2norm_in_kernel=False
+        #       ),
     }
 )
 
@@ -412,7 +426,6 @@ try:
     built = tvm.build(mod, target=target)
     print("BUILD SUCCEEDED")
     # Print generated CUDA source
-    cuda_src = built.imported_modules[0].get_source()
-    print(cuda_src)
+    # print(built.imports[0].inspect_source())
 except Exception as e:
     print(f"BUILD FAILED: {type(e).__name__}: {e}")
