@@ -376,6 +376,32 @@ def _chunk_recurrent_gated_delta_rule():
     return te.create_prim_func(inputs + outputs)
 
 
-print(_gen_causal_conv1d_update(128, 128).script())
-print(_chunk_gated_delta_rule(32, 128, 16, 128, use_qk_l2norm_in_kernel=False).script())
-print(_chunk_gated_delta_rule(32, 128, 16, 128, use_qk_l2norm_in_kernel=True).script())
+#print(_gen_causal_conv1d_update(128, 128).script())
+#print(_chunk_gated_delta_rule(32, 128, 16, 128, use_qk_l2norm_in_kernel=False))
+#print(_chunk_gated_delta_rule(32, 128, 16, 128, use_qk_l2norm_in_kernel=True))
+#
+
+mod = tvm.IRModule(
+    {
+        #"conv1d_biased": _gen_causal_conv1d_update(128, 128, has_bias=True),
+        #"conv1d_nobias": _gen_causal_conv1d_update(128, 128, has_bias=False),
+                "chunk_gated_delta_l2_norm": _chunk_gated_delta_rule(
+                    32, 128, 16, 128, use_qk_l2norm_in_kernel=True
+                ),
+        #        "chunk_gated_delta": _chunk_gated_delta_rule(
+        #            32, 128, 16, 128, use_qk_l2norm_in_kernel=False
+        #        ),
+    }
+)
+
+mod.show()
+
+#from tvm import dlight as dl
+# Target must be in scope or explicitly passed
+target = tvm.target.Target("cuda") 
+from tvm.s_tir import dlight as dl
+
+# DLight is now a transformation pass
+with target:
+    mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
+    mod.show()
