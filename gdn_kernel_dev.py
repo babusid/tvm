@@ -591,3 +591,14 @@ from tvm.s_tir import dlight as dl
 with target:
     mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
     mod.show()
+
+# Try to build to CUDA
+print("\n\n=== Attempting tvm.build to CUDA ===")
+try:
+    built = tvm.build(mod, target=target)
+    print("BUILD SUCCEEDED")
+    # Print generated CUDA source
+    cuda_src = built.imported_modules[0].get_source()
+    print(cuda_src)
+except Exception as e:
+    print(f"BUILD FAILED: {type(e).__name__}: {e}")
