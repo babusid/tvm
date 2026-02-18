@@ -369,7 +369,38 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
         mask = T.alloc_buffer((_chunk_size, _chunk_size), dtype=_dtype)
-
+        g_cumsum = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+        decay_mask = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+        attn = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+        padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
+        padded_len = seq_len + padding
+        num_chunks = padded_len // _chunk_size
         # TODO: conditional l2 norm of q, k here
 
         # transpose, pad, scale query
@@ -389,7 +420,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padding,
             _linear_key_head_dim,
         ):
             with T.sblock("pad_fill_qk"):
@@ -409,7 +440,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, vd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padding,
             _linear_value_head_dim,
         ):
             with T.sblock("pad_fill_v"):
@@ -427,7 +458,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s in T.grid(
             batch_size,
             _linear_num_value_heads,
-            ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padding,
         ):
             with T.sblock("pad_fill_gb"):
                 vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
@@ -437,7 +468,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, vd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padded_len,
             _linear_value_head_dim,
         ):
             with T.sblock("v_beta"):
@@ -447,7 +478,7 @@ def _chunk_gated_delta_rule(
         for b, nk, s, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padded_len,
             _linear_key_head_dim,
         ):
             with T.sblock("k_beta"):
@@ -457,7 +488,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padded_len,
             _linear_key_head_dim,
         ):
             with T.sblock("chunk_reshape_q_k_kbeta"):
@@ -475,11 +506,14 @@ def _chunk_gated_delta_rule(
         for b, nv, s, vd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padded_len,
             _linear_value_head_dim,
         ):
-            with T.sblock(("chunk_reshape_vbeta")):
+            with T.sblock(("chunk_reshape_v_vbeta")):
                 vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
+                value_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = value_T[
+                    vb, vnv, vs, vvd
+                ]
                 v_beta_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = v_beta[
                     vb, vnv, vs, vvd
                 ]
@@ -487,23 +521,77 @@ def _chunk_gated_delta_rule(
         for b, nv, s in T.grid(
             batch_size,
             _linear_num_value_heads,
-            seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+            padded_len,
         ):
             with T.sblock("chunk_reshape_g"):
                 vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
                 g_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size] = g_T[vb, vnv, vs]
 
-        for c1, c2 in T.grid(
-                _chunk_size,
-                _chunk_size
+        for c1, c2 in T.grid(_chunk_size, _chunk_size):
+            with T.sblock("mask"):
+                vc1, vc2 = T.axis.remap("SS", [c1, c2])
+                mask[vc1, vc2] = T.if_then_else(vc2 >= vc1, T.float32(1.0), T.float32(0.0))
+
+        for b, nv, s, c, r in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
         ):
-            with T.sblock("create_upper_triu_mask"):
-                vc1, vc2 = T.axis.remap("SS", [c1,c2])
-                # iterate from start column == row idx to end of row
-                # clamp to last index
-                mask[vc1, T.min(vc1 + vc2, _chunk_size-1)] = T.float32(1.0)
+            # there's got to be a better way to do this than the n**2 approach
+            # how can we do prefix scan?
+            with T.sblock("g_cumsum"):
+                vb, vnv, vs, vc, vr = T.axis.remap("SSSSR", [b, nv, s, c, r])
+                with T.init():
+                    g_cumsum[vb, vnv, vs, vc] = T.float32(0.0)
+                g_cumsum[vb, vnv, vs, vc] = g_cumsum[vb, vnv, vs, vc] + T.if_then_else(
+                    vr <= vc, g_chunked[vb, vnv, vs, vr], T.float32(0.0)
+                )
 
+        for b, nv, s, c1, c2 in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
+        ):
+            with T.sblock("create_decay_mask"):
+                # step 1: g.unsqueeze(-1) - g.unsqueeze(-2)
+                # b,v,s,c,1 - b,v,s,1,c
+                # first one treats last dim (c) as a column, second one treats last dim (c) as a row
+                # algo: let i, j be iterators on c
+                #       we form a matrix where each i,j cell represents b,v,s,i - b,v,s,j
+                # collapse the tril / exp / tril into just one stage
+                vb, vnv, vs, i, j = T.axis.remap("SSSSS", [b, nv, s, c1, c2])
+                decay_mask[vb, vnv, vs, i, j] = T.if_then_else(
+                    i >= j,
+                    T.exp(g_cumsum[vb, vnv, vs, i] - g_cumsum[vb, vnv, vs, j]),
+                    T.float32(0.0),
+                )
 
+        # attn = k_beta_chunked @ key_chunked^T — split into init + serial accumulate
+        # to avoid decompose_reduction failing on symbolic num_chunks
+        # k_beta_chunked = batch, num value heads, num chunks, chunksize, key head dim
+        # key_chunked = batch, num value heads, num chunks, chunksize,  key head dim
+        # decay_mask = batch, num value heads, num chunks, chunk size, chunk size
+        # attn = batch, num value heads, num_chunks, chunk size, chunk size
+        for b, nv, nc, c1, c2, kd in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // chunk_size,
+            chunk_size,
+            chunk_size,
+            _linear_key_head_dim,
+        ):
+            with T.sblock("attn_mm"):
+                vb, vnv, vnc, vc1, vc2, vkd = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, kd])
+                with T.init():
+                    attn[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+
+                attn[vb, vnv, vnc, vc1, vc2] += (
+                    k_beta_chunked[vb, vnv, vnc, vc1, vkd] * key_chunked[vb, vnv, vnc, vc2, vkd]
+                )
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -515,7 +603,6 @@ def _chunk_recurrent_gated_delta_rule():
     inputs = []
     outputs = []
     return te.create_prim_func(inputs + outputs)
-
 
 
 mod = tvm.IRModule(
@@ -533,6 +620,7 @@ mod = tvm.IRModule(
     }
 )
 
+print("\n\n=== raw tir  ===")
 mod.show()
 
 # from tvm import dlight as dl
@@ -540,10 +628,34 @@ mod.show()
 target = tvm.target.Target("cuda")
 from tvm.s_tir import dlight as dl
 
-# DLight is now a transformation pass
+
 with target:
+    
+    # schedule the attn mm block
+    func = mod["chunk_gated_delta"]
+    sch = s_tir.Schedule(func)
+
+    attn_block = sch.get_sblock("attn_mm")
+    b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
+
+    # Bind b and nv separately — no symbolic div/mod needed
+    sch.bind(b, "blockIdx.x")
+    sch.bind(nv, "blockIdx.y")
+    sch.bind(nc, "blockIdx.z")
+
+    # c1*c2 = 4096, all constant — safe to fuse and split
+    c1_c2 = sch.fuse(c1, c2)
+    c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, 1024])
+    sch.bind(c1_c2_o, "vthread.x")  # 4 virtual threads
+    sch.bind(c1_c2_i, "threadIdx.x")
+    #sch.annotate(attn_block, "tir.is_scheduled", 1)
+    
+    mod["chunk_gated_delta"] = sch.mod["main"]
+    mod.show()
+
     mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
     mod.show()
+
 
 # Try to build to CUDA
 print("\n\n=== Attempting tvm.build to CUDA ===")
@@ -551,6 +663,6 @@ try:
     built = tvm.build(mod, target=target)
     print("BUILD SUCCEEDED")
     # Print generated CUDA source
-    print(built.imports[0].inspect_source())
+    # print(built.imports[0].inspect_source())
 except Exception as e:
     print(f"BUILD FAILED: {type(e).__name__}: {e}")
