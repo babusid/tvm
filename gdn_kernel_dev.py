@@ -621,38 +621,105 @@ mod = tvm.IRModule(
 print("\n\n=== raw tir  ===")
 mod.show()
 
-# from tvm import dlight as dl
-# Target must be in scope or explicitly passed
 target = tvm.target.Target("cuda")
-from tvm.s_tir import dlight as dl
+
+# ======================================================================
+# Manual scheduling for all blocks.
+# dlight's Fallback scheduler cannot handle the attn_mm block because
+# fusing 6 loops (including the symbolic num_chunks) creates non-affine
+# bindings that violate the reduction-block quasi-affine requirement.
+# We schedule everything manually instead.
+# ======================================================================
+
+MAX_THREADS = 1024
+
+sch = s_tir.Schedule(mod["chunk_gated_delta"])
 
 
-with target:
-    
-    # schedule the attn mm block
-    # func = mod["chunk_gated_delta"]
-    # sch = s_tir.Schedule(func)
+def schedule_spatial_fallback(sch, block_name):
+    """
+    Replicate dlight Fallback for a pure-spatial block:
+      fuse all loops -> split [blockIdx.x, threadIdx.x(1024)]
+    """
+    block = sch.get_sblock(block_name)
+    loops = sch.get_loops(block)
+    fused = sch.fuse(*loops)
+    bx, tx = sch.split(fused, factors=[None, MAX_THREADS])
+    sch.bind(bx, "blockIdx.x")
+    sch.bind(tx, "threadIdx.x")
 
-    # attn_block = sch.get_sblock("attn_mm")
-    # b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
 
-    ## Bind b and nv separately — no symbolic div/mod needed
-    # sch.bind(b, "blockIdx.x")
-    # sch.bind(nv, "blockIdx.y")
-    # sch.bind(nc, "blockIdx.z")
+def schedule_reduction_fallback(sch, block_name):
+    """
+    Replicate dlight Fallback for a reduction block:
+      reorder spatial loops before reduction loops,
+      fuse spatial -> split [blockIdx.x, threadIdx.x(1024)],
+      decompose_reduction at the first reduction loop.
+    """
+    block = sch.get_sblock(block_name)
+    loops = sch.get_loops(block)
+    # The last loop is the reduction loop (R), all others are spatial (S)
+    s_loops = loops[:-1]
+    r_loop = loops[-1]
+    fused = sch.fuse(*s_loops)
+    bx, tx = sch.split(fused, factors=[None, MAX_THREADS])
+    sch.bind(bx, "blockIdx.x")
+    sch.bind(tx, "threadIdx.x")
+    sch.decompose_reduction(block, r_loop)
 
-    ## c1*c2 = 4096, all constant — safe to fuse and split
-    # c1_c2 = sch.fuse(c1, c2)
-    # c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, 1024])
-    # sch.bind(c1_c2_o, "vthread.x")  # 4 virtual threads
-    # sch.bind(c1_c2_i, "threadIdx.x")
-    ##sch.annotate(attn_block, "tir.is_scheduled", 1)
-    #
-    # mod["chunk_gated_delta"] = sch.mod["main"]
-    # mod.show()
 
-    mod = dl.ApplyDefaultSchedule(dl.gpu.Matmul(), dl.gpu.Fallback())(mod)
-    mod.show()
+# --- Schedule all spatial blocks (pure element-wise / transpose / pad / reshape) ---
+spatial_blocks = [
+    "transpose_qk_scale_q",
+    "pad_fill_qk",
+    "transpose_v",
+    "pad_fill_v",
+    "transpose_gb",
+    "pad_fill_gb",
+    "v_beta",
+    "k_beta",
+    "chunk_reshape_q_k_kbeta",
+    "chunk_reshape_v_vbeta",
+    "chunk_reshape_g",
+    "mask",
+    "create_decay_mask",
+]
+
+for name in spatial_blocks:
+    schedule_spatial_fallback(sch, name)
+
+# --- Schedule g_cumsum (5D with reduction on last axis) ---
+# Loops: b, nv, num_chunks, chunk_size, chunk_size(R)
+schedule_reduction_fallback(sch, "g_cumsum")
+
+# --- Schedule attn_mm (6D matmul-like reduction) ---
+# Loops: b, nv, nc, c1, c2, kd(R)
+# Cannot fuse all 5 spatial dims because nc is symbolic (depends on seq_len).
+# Strategy: bind b -> blockIdx.x, nv -> blockIdx.y, nc -> blockIdx.z,
+#           fuse c1*c2 (64*64=4096) -> split to threads,
+#           kd is serial reduction.
+attn_block = sch.get_sblock("attn_mm")
+b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
+
+sch.bind(b, "blockIdx.x")
+sch.bind(nv, "blockIdx.y")
+sch.bind(nc, "blockIdx.z")
+
+# c1*c2 = 64*64 = 4096 -> split into [4, 1024] for vthread + threadIdx.x
+c1_c2 = sch.fuse(c1, c2)
+c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, MAX_THREADS])
+sch.bind(c1_c2_o, "vthread.x")
+sch.bind(c1_c2_i, "threadIdx.x")
+
+# Decompose init from reduction; kd is the reduction loop
+sch.decompose_reduction(attn_block, kd)
+
+
+# Apply is_scheduled attribute so dlight/default GPU schedule skips this
+mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
+
+print("\n\n=== manually scheduled tir  ===")
+mod.show()
 
 
 # Try to build to CUDA
@@ -661,6 +728,7 @@ try:
     built = tvm.build(mod, target=target)
     print("BUILD SUCCEEDED")
     # Print generated CUDA source
-    # print(built.imports[0].inspect_source())
+    cuda_src = built.imports[0].inspect_source()
+    print(cuda_src)
 except Exception as e:
     print(f"BUILD FAILED: {type(e).__name__}: {e}")
