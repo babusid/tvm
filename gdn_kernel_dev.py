@@ -412,9 +412,7 @@ def _chunk_gated_delta_rule(
                 T.reads(query_buf[vb, vs, vnv, vkd], key_buf[vb, vs, vnv, vkd])
                 T.writes(query_T[vb, vnv, vs, vkd], key_T[vb, vnv, vs, vkd])
                 # inline scaling of query while doing the transpose
-                query_T[vb, vnv, vs, vkd] = query_buf[vb, vs, vnv, vkd] * (
-                    1 / (_linear_value_head_dim**0.5)
-                )
+                query_T[vb, vnv, vs, vkd] = query_buf[vb, vs, vnv, vkd] * _scale
                 key_T[vb, vnv, vs, vkd] = key_buf[vb, vs, vnv, vkd]
 
         for b, nv, s, kd in T.grid(
@@ -632,28 +630,28 @@ from tvm.s_tir import dlight as dl
 with target:
     
     # schedule the attn mm block
-    func = mod["chunk_gated_delta"]
-    sch = s_tir.Schedule(func)
+    # func = mod["chunk_gated_delta"]
+    # sch = s_tir.Schedule(func)
 
-    attn_block = sch.get_sblock("attn_mm")
-    b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
+    # attn_block = sch.get_sblock("attn_mm")
+    # b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
 
-    # Bind b and nv separately — no symbolic div/mod needed
-    sch.bind(b, "blockIdx.x")
-    sch.bind(nv, "blockIdx.y")
-    sch.bind(nc, "blockIdx.z")
+    ## Bind b and nv separately — no symbolic div/mod needed
+    # sch.bind(b, "blockIdx.x")
+    # sch.bind(nv, "blockIdx.y")
+    # sch.bind(nc, "blockIdx.z")
 
-    # c1*c2 = 4096, all constant — safe to fuse and split
-    c1_c2 = sch.fuse(c1, c2)
-    c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, 1024])
-    sch.bind(c1_c2_o, "vthread.x")  # 4 virtual threads
-    sch.bind(c1_c2_i, "threadIdx.x")
-    #sch.annotate(attn_block, "tir.is_scheduled", 1)
-    
-    mod["chunk_gated_delta"] = sch.mod["main"]
-    mod.show()
+    ## c1*c2 = 4096, all constant — safe to fuse and split
+    # c1_c2 = sch.fuse(c1, c2)
+    # c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, 1024])
+    # sch.bind(c1_c2_o, "vthread.x")  # 4 virtual threads
+    # sch.bind(c1_c2_i, "threadIdx.x")
+    ##sch.annotate(attn_block, "tir.is_scheduled", 1)
+    #
+    # mod["chunk_gated_delta"] = sch.mod["main"]
+    # mod.show()
 
-    mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
+    mod = dl.ApplyDefaultSchedule(dl.gpu.Matmul(), dl.gpu.Fallback())(mod)
     mod.show()
 
 
