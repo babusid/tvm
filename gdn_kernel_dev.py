@@ -387,7 +387,7 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        attn_raw = T.alloc_buffer(
+        attn_mm_out = T.alloc_buffer(
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -397,7 +397,7 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        attn = T.alloc_buffer(
+        attn_decay_neg_mask_out = T.alloc_buffer(
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -407,6 +407,17 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
+        attn_associative_scan_out = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+
         padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
         padded_len = seq_len + padding
         num_chunks = padded_len // _chunk_size
@@ -572,12 +583,8 @@ def _chunk_gated_delta_rule(
                     T.float32(0.0),
                 )
 
-        # attn = k_beta_chunked @ key_chunked^T — split into init + serial accumulate
-        # to avoid decompose_reduction failing on symbolic num_chunks
-        # k_beta_chunked = batch, num value heads, num chunks, chunksize, key head dim
-        # key_chunked = batch, num value heads, num chunks, chunksize,  key head dim
-        # decay_mask = batch, num value heads, num chunks, chunk size, chunk size
-        # attn = batch, num value heads, num_chunks, chunk size, chunk size
+        # attn = k_beta_chunked @ key_chunked^T
+        # to avoid compile failures
         for b, nv, nc, c1, c2, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
@@ -589,9 +596,9 @@ def _chunk_gated_delta_rule(
             with T.sblock("attn_mm"):
                 vb, vnv, vnc, vc1, vc2, vkd = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, kd])
                 with T.init():
-                    attn_raw[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                    attn_mm_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
 
-                attn_raw[vb, vnv, vnc, vc1, vc2] += (
+                attn_mm_out[vb, vnv, vnc, vc1, vc2] += (
                     k_beta_chunked[vb, vnv, vnc, vc1, vkd] * key_chunked[vb, vnv, vnc, vc2, vkd]
                 )
 
@@ -604,11 +611,36 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("attn_decay_neg_mask"):
                 vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
-                attn[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
+                attn_decay_neg_mask_out[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
                     vc2 >= vc1,
                     T.float32(0.0),
-                    attn_raw[vb, vnv, vnc, vc1, vc2] * (-1 * decay_mask[vb, vnv, vnc, vc1, vc2]),
+                    attn_mm_out[vb, vnv, vnc, vc1, vc2] * (-1 * decay_mask[vb, vnv, vnc, vc1, vc2]),
                 )
+
+        # Associative scan: for each row i, update row i using rows 0..i-1
+        # attn[i, j] = attn[i, j] + sum_{k=0}^{i-1} attn[i, k] * attn[k, j]
+        # Strategy: Parallelize over (batch, heads, chunks), sequential scan within each thread
+        # Using explicit thread_binding here since s_tir.Schedule API doesn't support triangular bounds?
+        for b in T.thread_binding(batch_size, thread="blockIdx.x"):
+            for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
+                for nc in T.thread_binding(num_chunks, thread="threadIdx.x"):
+                    # Sequential scan over rows - each row i depends on rows 0..i-1
+                    for i in T.serial(1, _chunk_size):
+                        # For each column j in row i (j < i for lower triangular)
+                        for j in T.serial(0, i):
+                            # Start with original value
+                            attn_associative_scan_out[b, nv, nc, i, j] = attn_decay_neg_mask_out[
+                                b, nv, nc, i, j
+                            ]
+                            # Reduce over k. k is 0->i not inclusive, 
+                            # so we are summing with our target element in our row
+                            # the product of kth element in our row and kth column in the rows
+                            # below 
+                            for k in T.serial(0, i):
+                                attn_associative_scan_out[b, nv, nc, i, j] += (
+                                    attn_decay_neg_mask_out[b, nv, nc, i, k]
+                                    * attn_decay_neg_mask_out[b, nv, nc, k, j]
+                                )
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -701,8 +733,8 @@ spatial_blocks = [
     "chunk_reshape_v_vbeta",
     "chunk_reshape_g",
     "create_decay_mask",
-    # "attn_mask_decay_neg",
     "attn_decay_neg_mask",
+    # Note: attn_assoc_scan_copy uses explicit thread_binding in TIR, so not scheduled here
 ]
 
 for name in spatial_blocks:
@@ -733,7 +765,6 @@ sch.bind(c1_c2_i, "threadIdx.x")
 
 # Decompose init from reduction; kd is the reduction loop
 sch.decompose_reduction(attn_block, kd)
-
 
 # Apply is_scheduled attribute so dlight/default GPU schedule skips this
 mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
