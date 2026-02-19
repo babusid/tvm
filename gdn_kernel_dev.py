@@ -368,7 +368,6 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        mask = T.alloc_buffer((_chunk_size, _chunk_size), dtype=_dtype)
         g_cumsum = T.alloc_buffer(
             (
                 batch_size,
@@ -379,6 +378,16 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
         decay_mask = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+        attn_raw = T.alloc_buffer(
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -525,11 +534,6 @@ def _chunk_gated_delta_rule(
                 vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
                 g_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size] = g_T[vb, vnv, vs]
 
-        for c1, c2 in T.grid(_chunk_size, _chunk_size):
-            with T.sblock("mask"):
-                vc1, vc2 = T.axis.remap("SS", [c1, c2])
-                mask[vc1, vc2] = T.if_then_else(vc2 >= vc1, T.float32(1.0), T.float32(0.0))
-
         for b, nv, s, c, r in T.grid(
             batch_size,
             _linear_num_value_heads,
@@ -577,18 +581,33 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c1, c2, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // chunk_size,
-            chunk_size,
-            chunk_size,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
             _linear_key_head_dim,
         ):
             with T.sblock("attn_mm"):
                 vb, vnv, vnc, vc1, vc2, vkd = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, kd])
                 with T.init():
-                    attn[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                    attn_raw[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
 
-                attn[vb, vnv, vnc, vc1, vc2] += (
+                attn_raw[vb, vnv, vnc, vc1, vc2] += (
                     k_beta_chunked[vb, vnv, vnc, vc1, vkd] * key_chunked[vb, vnv, vnc, vc2, vkd]
+                )
+
+        for b, nv, nc, c1, c2 in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
+        ):
+            with T.sblock("attn_decay_neg_mask"):
+                vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
+                attn[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
+                    vc2 >= vc1,
+                    T.float32(0.0),
+                    attn_raw[vb, vnv, vnc, vc1, vc2] * (-1 * decay_mask[vb, vnv, vnc, vc1, vc2]),
                 )
 
     if use_qk_l2norm_in_kernel:
@@ -681,8 +700,9 @@ spatial_blocks = [
     "chunk_reshape_q_k_kbeta",
     "chunk_reshape_v_vbeta",
     "chunk_reshape_g",
-    "mask",
     "create_decay_mask",
+    # "attn_mask_decay_neg",
+    "attn_decay_neg_mask",
 ]
 
 for name in spatial_blocks:
