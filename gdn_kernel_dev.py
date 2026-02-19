@@ -418,6 +418,47 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
+        attn_identity_add_out = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+
+        value_attn_vbeta_matmul_out = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_value_head_dim,
+            )
+        )
+
+        k_beta_x_g_cumsum_exp_tmp = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_key_head_dim,
+            ),
+            dtype=_dtype,
+        )
+        k_cumdecay = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_key_head_dim,
+            )
+        )
+
         padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
         padded_len = seq_len + padding
         num_chunks = padded_len // _chunk_size
@@ -584,7 +625,6 @@ def _chunk_gated_delta_rule(
                 )
 
         # attn = k_beta_chunked @ key_chunked^T
-        # to avoid compile failures
         for b, nv, nc, c1, c2, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
@@ -632,15 +672,74 @@ def _chunk_gated_delta_rule(
                             attn_associative_scan_out[b, nv, nc, i, j] = attn_decay_neg_mask_out[
                                 b, nv, nc, i, j
                             ]
-                            # Reduce over k. k is 0->i not inclusive, 
-                            # so we are summing with our target element in our row
-                            # the product of kth element in our row and kth column in the rows
-                            # below 
+                            # selects each element in the row we're on, and the jth element of each each row below
+                            # current row. this mirrors the broadcast and elementwise multiply
+                            # use inline += to mirror the column sum
                             for k in T.serial(0, i):
                                 attn_associative_scan_out[b, nv, nc, i, j] += (
-                                    attn_decay_neg_mask_out[b, nv, nc, i, k]
-                                    * attn_decay_neg_mask_out[b, nv, nc, k, j]
+                                    attn_associative_scan_out[b, nv, nc, i, k]
+                                    * attn_associative_scan_out[b, nv, nc, k, j]
                                 )
+
+        for b, nv, nc, c1, c2 in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
+        ):
+            with T.sblock("attn_add_identity"):
+                vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
+                attn_identity_add_out[vb, vnv, vnc, vc1, vc2] = attn_associative_scan_out[
+                    vb, vnv, vnc, vc1, vc2
+                ] + T.if_then_else(vc2 == vc1, T.float32(1.0), T.float32(0.0))
+
+        # value = attn @ v_beta
+        for b, nv, nc, c, vd, r in T.grid(
+            batch_size,
+            _linear_value_head_dim,
+            num_chunks,
+            _chunk_size,
+            _linear_value_head_dim,
+            _chunk_size,
+        ):
+            with T.sblock("value_attn_vbeta_matmul"):
+                vb, vnv, vnc, vc, vvd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, vd, r])
+                with T.init():
+                    value_attn_vbeta_matmul_out[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+
+                value_attn_vbeta_matmul_out[vb, vnv, vnc, vc, vvd] += (
+                    attn_identity_add_out[vb, vnv, vnc, vc, vr]
+                    * v_beta_chunked[vb, vnv, vnc, vr, vvd]
+                )
+
+        # k_cumdecay = attn @ (k_beta x g.exp().unsqueeze(-1))
+        # attn_identity_add_out
+        # k_beta_chunked
+        # g_cumsum
+        for b, nv, nc, c, vd in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_value_head_dim
+        ):
+            with T.sblock("k_cumdecay_internal"):
+                vb, vnv, vnc, vc, vvd = T.axis.remap("SSSSS", [b, nv, nc, c, vd])
+                k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vc, vvd] = k_beta_chunked[
+                    vb, vnv, vnc, vc, vvd
+                ] * T.exp(g_cumsum[vb, vnv, vnc, vc])
+
+        for b, nv, nc, c, kd, r in T.grid(
+            batch_size,
+            _linear_value_head_dim,
+            num_chunks,
+            _chunk_size,
+            _linear_key_head_dim,
+            _chunk_size,
+        ):
+            with T.sblock("k_cumdecay_mm"):
+                vb, vnv, vnc, vc, vkd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, kd, r])
+                with T.init():
+                    k_cumdecay[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+
+                k_cumdecay[vb, vnv, vnc, vc, vkd] += attn_identity_add_out[vb, vnv, vnc, vc, vr] * k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vr, vkd]
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -676,10 +775,8 @@ target = tvm.target.Target("cuda")
 
 # ======================================================================
 # Manual scheduling for all blocks.
-# dlight's Fallback scheduler cannot handle the attn_mm block because
-# fusing 6 loops (including the symbolic num_chunks) creates non-affine
-# bindings that violate the reduction-block quasi-affine requirement.
-# We schedule everything manually instead.
+# dlight's Fallback scheduler cannot handle some of our weirder blocks
+# like the 6d matmuls and the associative scan
 # ======================================================================
 
 MAX_THREADS = 1024
@@ -734,37 +831,58 @@ spatial_blocks = [
     "chunk_reshape_g",
     "create_decay_mask",
     "attn_decay_neg_mask",
-    # Note: attn_assoc_scan_copy uses explicit thread_binding in TIR, so not scheduled here
+    "attn_add_identity",
+    "k_cumdecay_internal",
+    # Note: attn_assoc_scan uses explicit thread_binding in TIR, so not scheduled here
 ]
 
 for name in spatial_blocks:
     schedule_spatial_fallback(sch, name)
 
-# --- Schedule g_cumsum (5D with reduction on last axis) ---
+# Schedule g_cumsum (5D with reduction on last axis) ---
 # Loops: b, nv, num_chunks, chunk_size, chunk_size(R)
 schedule_reduction_fallback(sch, "g_cumsum")
 
-# --- Schedule attn_mm (6D matmul-like reduction) ---
-# Loops: b, nv, nc, c1, c2, kd(R)
-# Cannot fuse all 5 spatial dims because nc is symbolic (depends on seq_len).
-# Strategy: bind b -> blockIdx.x, nv -> blockIdx.y, nc -> blockIdx.z,
-#           fuse c1*c2 (64*64=4096) -> split to threads,
-#           kd is serial reduction.
-attn_block = sch.get_sblock("attn_mm")
-b, nv, nc, c1, c2, kd = sch.get_loops(attn_block)
+def schedule_6d_batched_matmul(sch, block_name, spatial_dim_names, reduction_name):
+    """
+    Schedule a 6D batched matmul: (b, nv, nc, d1, d2, r)
+    Strategy: bind b->blockIdx.x, nv->blockIdx.y, nc->blockIdx.z,
+              fuse d1*d2 -> split to threads, keep r as serial reduction
+    """
+    block = sch.get_sblock(block_name)
+    loops = sch.get_loops(block)
+    
+    # Unpack: b, nv, nc, d1, d2, r
+    b, nv, nc = loops[0], loops[1], loops[2]
+    d1, d2 = loops[3], loops[4]
+    r = loops[5]
+    
+    sch.bind(b, "blockIdx.x")
+    sch.bind(nv, "blockIdx.y")
+    sch.bind(nc, "blockIdx.z")
+    
+    # Fuse the two constant spatial dims and split to threads
+    d1_d2 = sch.fuse(d1, d2)
+    d1_d2_o, d1_d2_i = sch.split(d1_d2, factors=[None, MAX_THREADS])
+    sch.bind(d1_d2_o, "vthread.x")
+    sch.bind(d1_d2_i, "threadIdx.x")
+    
+    # Decompose reduction
+    sch.decompose_reduction(block, r)
 
-sch.bind(b, "blockIdx.x")
-sch.bind(nv, "blockIdx.y")
-sch.bind(nc, "blockIdx.z")
 
-# c1*c2 = 64*64 = 4096 -> split into [4, 1024] for vthread + threadIdx.x
-c1_c2 = sch.fuse(c1, c2)
-c1_c2_o, c1_c2_i = sch.split(c1_c2, factors=[None, MAX_THREADS])
-sch.bind(c1_c2_o, "vthread.x")
-sch.bind(c1_c2_i, "threadIdx.x")
+# manually schedule the high dim batched matmuls
+# Pattern: (batch, heads, chunks, dim1, dim2, reduction)
+# Strategy: bind outer 3 dims to blocks, fuse inner 2 constant dims to threads
 
-# Decompose init from reduction; kd is the reduction loop
-sch.decompose_reduction(attn_block, kd)
+# attn_mm: (b, nv, nc, c1, c2, kd) where c1=c2=64, kd=128
+schedule_6d_batched_matmul(sch, "attn_mm", ["c1", "c2"], "kd")
+
+# value_attn_vbeta_matmul: (b, nv, nc, c, vd, r) where c=64, vd=128, r=64
+schedule_6d_batched_matmul(sch, "value_attn_vbeta_matmul", ["c", "vd"], "r")
+
+# k_cumdecay_mm: (b, nv, nc, c, kd, r) where c=64, kd=128, r=64
+schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
 
 # Apply is_scheduled attribute so dlight/default GPU schedule skips this
 mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
