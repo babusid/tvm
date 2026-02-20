@@ -193,8 +193,14 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
     query = torch.randn(batch_size, seq_len, num_v_heads, k_head_dim, dtype=dtype, device=device)
     key = torch.randn(batch_size, seq_len, num_v_heads, k_head_dim, dtype=dtype, device=device)
     value = torch.randn(batch_size, seq_len, num_v_heads, v_head_dim, dtype=dtype, device=device)
-    g = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
-    beta = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    
+    # g should be negative (decay parameter): g = -A * softplus(a + dt_bias)
+    # Typical range: [-20, -0.1] for numerical stability
+    g = -torch.rand(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 5.0 - 0.1
+    
+    # beta should be in (0, 1) (gating parameter): beta = sigmoid(b)
+    # Use sigmoid to ensure proper range
+    beta = torch.sigmoid(torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device))
     
     # PyTorch reference
     print("\nRunning PyTorch reference...")
@@ -227,7 +233,7 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
     ctx = tvm.cuda(0)
     
     # Create output buffers
-    tvm_out = tvm.runtime.empty((batch_size, seq_len, num_v_heads, v_head_dim), dtype="float32", device=ctx)
+    tvm_core_attn_out = tvm.runtime.empty((batch_size, seq_len, num_v_heads, v_head_dim), dtype="float32", device=ctx)
     tvm_state_out = tvm.runtime.empty((batch_size, num_v_heads, k_head_dim, v_head_dim), dtype="float32", device=ctx)
     
     # Convert PyTorch tensors to TVM
@@ -249,12 +255,15 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
         tvm_g,
         tvm_beta,
         tvm_initial_state,
-        tvm_out,
+        tvm_core_attn_out,
         tvm_state_out,
     )
     
     # Convert back to numpy for comparison
-    tvm_out_np = tvm_out.numpy()
+    tvm_out_np = tvm_core_attn_out.numpy()
+
+    print(torch_out)
+    print(tvm_out_np)
     torch_out_np = torch_out.cpu().numpy()
     
     # Check results
