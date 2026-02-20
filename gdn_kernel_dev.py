@@ -858,13 +858,11 @@ def _chunk_gated_delta_rule(
         # Each element within the chunk (chunk_size) can be done in parallel though.
         for b in T.thread_binding(batch_size, thread="blockIdx.x"):
             for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
-                for i in T.serial(
-                    num_chunks
-                ):  # Sequential over chunks - moved outside thread binding
+                for i in T.serial(tir.ceildiv(seq_len, _chunk_size)):  # Sequential over chunks - moved outside thread binding
                     for c in T.thread_binding(_chunk_size, thread="threadIdx.x"):
-                        # v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
-                        # Shape: k_cumdecay[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
-                        #        -> v_prime[b, nv, i, chunk_size, value_dim]
+                    # v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+                    # Shape: k_cumdecay[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
+                    #        -> v_prime[b, nv, i, chunk_size, value_dim]
                         for vd in T.serial(_linear_value_head_dim):
                             # Initialize v_prime for this (c, vd) position
                             recurrent_state_update_v_buf[b, nv, i, c, vd] = T.float32(0.0)
@@ -893,13 +891,11 @@ def _chunk_gated_delta_rule(
                                 recurrent_state_update_attn_inter[b, nv, i, c, vd] += (
                                     elemw * recurrent_state_out_buf[b, nv, kd, vd]
                                 )
-
+                        
                         for vd in T.serial(_linear_value_head_dim):
                             # compute core_attn_out to intermediate buffer
                             # initialize to the attn_inter value
-                            core_attn_out_inter[b, nv, i, c, vd] = (
-                                recurrent_state_update_attn_inter[b, nv, i, c, vd]
-                            )
+                            core_attn_out_inter[b, nv, i, c, vd] = recurrent_state_update_attn_inter[b, nv, i, c, vd]
 
                             for r in T.serial(_chunk_size):
                                 attn_val = attn_identity_add_out[b, nv, i, c, r]
@@ -909,15 +905,18 @@ def _chunk_gated_delta_rule(
                     # Update recurrent state after processing chunk i
                     # PyTorch: last_recurrent_state = last_recurrent_state * g[:, :, i, -1, None, None].exp()
                     #          + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+                    # This happens once per (batch, head, chunk) after all threadIdx.x threads finish
+                    # We're still inside the thread bindings (blockIdx.x, blockIdx.y),
+                    # so we use serial loops here (can't add more thread bindings)
                     for kd in T.serial(_linear_key_head_dim):
                         for vd in T.serial(_linear_value_head_dim):
                             # Part 1: Decay old state by exp(g[i, -1])
                             # g_cumsum[b, nv, i, chunk_size-1] is the cumulative sum at the last position
                             g_last = g_cumsum[b, nv, i, _chunk_size - 1]
-                            recurrent_state_out_buf[b, nv, kd, vd] = recurrent_state_out_buf[
-                                b, nv, kd, vd
-                            ] * T.exp(g_last)
-
+                            recurrent_state_out_buf[b, nv, kd, vd] = (
+                                recurrent_state_out_buf[b, nv, kd, vd] * T.exp(g_last)
+                            )
+                            
                             # Part 2: Add contribution from current chunk: k.T @ (v_new * decay)
                             # decay[c_pos] = exp(g[i, -1] - g[i, c_pos]) for each position c_pos in chunk
                             # This is an outer product reduction: sum over chunk positions
@@ -925,31 +924,27 @@ def _chunk_gated_delta_rule(
                                 # Compute decay factor for this position
                                 g_curr = g_cumsum[b, nv, i, c_pos]
                                 decay_factor = T.exp(g_last - g_curr)
-
+                                
                                 # k[c_pos, kd] * (v_new[c_pos, vd] * decay_factor)
                                 k_val = key_chunked[b, nv, i, c_pos, kd]
                                 v_new_val = recurrent_state_update_v_buf[b, nv, i, c_pos, vd]
-
+                                
                                 recurrent_state_out_buf[b, nv, kd, vd] += (
                                     k_val * v_new_val * decay_factor
                                 )
-
+        
         # Transform intermediate output to final output shape
-        # 1. Unchunk: (batch, heads, num_chunks, chunk_size, value_dim) -> implicit flatten
+        # 1. Unchunk: (batch, heads, tir.ceildiv(seq_len, _chunk_size), chunk_size, value_dim) -> implicit flatten
         # 2. Remove padding: only copy first seq_len positions
         # 3. Transpose: (batch, heads, seq_len, value_dim) -> (batch, seq_len, heads, value_dim)
-        for b, s, nv, vd in T.grid(
-            batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim
-        ):
+        for b, s, nv, vd in T.grid(batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim):
             with T.sblock("transform_output"):
                 vb, vs, vnv, vvd = T.axis.remap("SSSS", [b, s, nv, vd])
                 # Compute which chunk and position within chunk
                 chunk_idx = vs // _chunk_size
                 chunk_pos = vs % _chunk_size
                 # Read from intermediate buffer and write to final output with transpose
-                core_attn_out_buf[vb, vs, vnv, vvd] = core_attn_out_inter[
-                    vb, vnv, chunk_idx, chunk_pos, vvd
-                ]
+                core_attn_out_buf[vb, vs, vnv, vvd] = core_attn_out_inter[vb, vnv, chunk_idx, chunk_pos, vvd]
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -963,158 +958,207 @@ def _chunk_recurrent_gated_delta_rule():
     return te.create_prim_func(inputs + outputs)
 
 
-mod = tvm.IRModule(
-    {
-        # "conv1d_biased_act": _gen_causal_conv1d_update(128, 128, has_bias=True),
-        # "conv1d_biased": _gen_causal_conv1d_update(128, 128, has_bias=True, activation=None),
-        # "conv1d_nobias_act": _gen_causal_conv1d_update(128, 128, has_bias=False),
-        # "conv1d_nobias": _gen_causal_conv1d_update(128, 128, has_bias=False, activation=None),
-        # "chunk_gated_delta_l2_norm": _chunk_gated_delta_rule(
-        #    32, 128, 16, 128, use_qk_l2norm_in_kernel=True
-        # ),
-        "chunk_gated_delta": _chunk_gated_delta_rule(
-            32, 128, 16, 128, use_qk_l2norm_in_kernel=False
-        ),
-    }
-)
+# ============================================================================
+# Builder functions for testing and usage
+# ============================================================================
 
-print("\n\n=== raw tir  ===")
-mod.show()
-
-target = tvm.target.Target("cuda")
-
-# ======================================================================
-# Manual scheduling for all blocks.
-# dlight's Fallback scheduler cannot handle some of our weirder blocks
-# like the 6d matmuls and the associative scan
-# ======================================================================
-
-MAX_THREADS = 1024
-
-sch = s_tir.Schedule(mod["chunk_gated_delta"])
-
-
-def schedule_spatial_fallback(sch, block_name):
+def build_causal_conv1d_update(
+    hidden_size: int,
+    state_len: int,
+    has_bias: bool = True,
+    activation: str = "silu",
+    target: str = "cuda",
+    dtype: str = "float32",
+):
     """
-    Replicate dlight Fallback for a pure-spatial block:
-      fuse all loops -> split [blockIdx.x, threadIdx.x(1024)]
+    Build and return a compiled TVM runtime module for causal_conv1d_update.
+    
+    Args:
+        hidden_size: Number of hidden dimensions
+        state_len: Length of convolution state (kernel_size - 1)
+        has_bias: Whether to include bias
+        activation: Activation function ("silu" or None)
+        target: Target platform (default: "cuda")
+        dtype: Data type (default: "float32")
+    
+    Returns:
+        Compiled TVM runtime module
     """
-    block = sch.get_sblock(block_name)
-    loops = sch.get_loops(block)
-    fused = sch.fuse(*loops)
-    bx, tx = sch.split(fused, factors=[None, MAX_THREADS])
-    sch.bind(bx, "blockIdx.x")
-    sch.bind(tx, "threadIdx.x")
+    from tvm.s_tir import dlight as dl
+    
+    func = _gen_causal_conv1d_update(
+        hidden_size=hidden_size,
+        state_len=state_len,
+        dtype=dtype,
+        activation=activation,
+        has_bias=has_bias,
+    )
+    mod = tvm.IRModule({"causal_conv1d_update": func})
+    target_obj = tvm.target.Target(target)
+    
+    # Apply dlight scheduling for GPU
+    with target_obj:
+        mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
+    
+    built = tvm.build(mod, target=target_obj)
+    return built
 
 
-def schedule_reduction_fallback(sch, block_name):
+def build_chunk_gated_delta_rule(
+    linear_num_value_heads: int,
+    linear_value_head_dim: int,
+    linear_num_key_heads: int,
+    linear_key_head_dim: int,
+    chunk_size: int = 64,
+    target: str = "cuda",
+    dtype: str = "float32",
+):
     """
-    Replicate dlight Fallback for a reduction block:
-      reorder spatial loops before reduction loops,
-      fuse spatial -> split [blockIdx.x, threadIdx.x(1024)],
-      decompose_reduction at the first reduction loop.
+    Build and return a compiled TVM runtime module for chunk_gated_delta_rule.
+    Includes manual scheduling for optimal performance.
+    
+    Args:
+        linear_num_value_heads: Number of value heads
+        linear_value_head_dim: Dimension of value heads
+        linear_num_key_heads: Number of key heads
+        linear_key_head_dim: Dimension of key heads
+        chunk_size: Size of chunks (default: 64)
+        target: Target platform (default: "cuda")
+        dtype: Data type (default: "float32")
+    
+    Returns:
+        Compiled TVM runtime module
     """
-    block = sch.get_sblock(block_name)
-    loops = sch.get_loops(block)
-    # The last loop is the reduction loop (R), all others are spatial (S)
-    s_loops = loops[:-1]
-    r_loop = loops[-1]
-    fused = sch.fuse(*s_loops)
-    bx, tx = sch.split(fused, factors=[None, MAX_THREADS])
-    sch.bind(bx, "blockIdx.x")
-    sch.bind(tx, "threadIdx.x")
-    sch.decompose_reduction(block, r_loop)
+    MAX_THREADS = 1024
+    
+    func = _chunk_gated_delta_rule(
+        linear_num_value_heads=linear_num_value_heads,
+        linear_value_head_dim=linear_value_head_dim,
+        linear_num_key_heads=linear_num_key_heads,
+        linear_key_head_dim=linear_key_head_dim,
+        chunk_size=chunk_size,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        dtype=dtype,
+    )
+    
+    mod = tvm.IRModule({"chunk_gated_delta": func})
+    sch = s_tir.Schedule(mod["chunk_gated_delta"])
+    
+    # Helper functions for scheduling
+    def schedule_spatial_fallback(sch_local, block_name):
+        """Fallback scheduling for spatial blocks."""
+        block = sch_local.get_sblock(block_name)
+        loops = sch_local.get_loops(block)
+        fused = sch_local.fuse(*loops)
+        bx, tx = sch_local.split(fused, factors=[None, MAX_THREADS])
+        sch_local.bind(bx, "blockIdx.x")
+        sch_local.bind(tx, "threadIdx.x")
+    
+    def schedule_reduction_fallback(sch_local, block_name):
+        """Fallback scheduling for reduction blocks."""
+        block = sch_local.get_sblock(block_name)
+        loops = sch_local.get_loops(block)
+        s_loops = loops[:-1]
+        r_loop = loops[-1]
+        fused = sch_local.fuse(*s_loops)
+        bx, tx = sch_local.split(fused, factors=[None, MAX_THREADS])
+        sch_local.bind(bx, "blockIdx.x")
+        sch_local.bind(tx, "threadIdx.x")
+        sch_local.decompose_reduction(block, r_loop)
+    
+    def schedule_6d_batched_matmul(sch_local, block_name, spatial_dim_names, reduction_name):
+        """Schedule a 6D batched matmul."""
+        block = sch_local.get_sblock(block_name)
+        loops = sch_local.get_loops(block)
+        b, nv, nc = loops[0], loops[1], loops[2]
+        d1, d2 = loops[3], loops[4]
+        r = loops[5]
+        sch_local.bind(b, "blockIdx.x")
+        sch_local.bind(nv, "blockIdx.y")
+        sch_local.bind(nc, "blockIdx.z")
+        d1_d2 = sch_local.fuse(d1, d2)
+        d1_d2_o, d1_d2_i = sch_local.split(d1_d2, factors=[None, MAX_THREADS])
+        sch_local.bind(d1_d2_o, "vthread.x")
+        sch_local.bind(d1_d2_i, "threadIdx.x")
+        sch_local.decompose_reduction(block, r)
+    
+    # Apply scheduling to all blocks
+    spatial_blocks = [
+        "copy_last_recurrent_to_out",
+        "transpose_qk_scale_q",
+        "pad_fill_qk",
+        "transpose_v",
+        "pad_fill_v",
+        "transpose_gb",
+        "pad_fill_gb",
+        "v_beta",
+        "k_beta",
+        "chunk_reshape_q_k_kbeta",
+        "chunk_reshape_v_vbeta",
+        "chunk_reshape_g",
+        "create_decay_mask",
+        "attn_decay_neg_mask",
+        "attn_add_identity",
+        "k_cumdecay_internal",
+        "transform_output",
+    ]
+    
+    for name in spatial_blocks:
+        schedule_spatial_fallback(sch, name)
+    
+    schedule_reduction_fallback(sch, "g_cumsum")
+    
+    schedule_6d_batched_matmul(sch, "attn_mm", ["c1", "c2"], "kd")
+    schedule_6d_batched_matmul(sch, "value_attn_vbeta_matmul", ["c", "vd"], "r")
+    schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
+    schedule_6d_batched_matmul(sch, "recurrent_state_mm_1", ["c1", "c2"], "r")
+    
+    # Mark as scheduled and build
+    mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
+    
+    target_obj = tvm.target.Target(target)
+    built = tvm.build(mod, target=target_obj)
+    return built
 
 
-# --- Schedule all spatial blocks (pure element-wise / transpose / pad / reshape) ---
-spatial_blocks = [
-    "copy_last_recurrent_to_out",
-    "transpose_qk_scale_q",
-    "pad_fill_qk",
-    "transpose_v",
-    "pad_fill_v",
-    "transpose_gb",
-    "pad_fill_gb",
-    "v_beta",
-    "k_beta",
-    "chunk_reshape_q_k_kbeta",
-    "chunk_reshape_v_vbeta",
-    "chunk_reshape_g",
-    "create_decay_mask",
-    "attn_decay_neg_mask",
-    "attn_add_identity",
-    "k_cumdecay_internal",
-    "transform_output",
-    # Note: attn_assoc_scan uses explicit thread_binding in TIR, so not scheduled here
-]
+# ============================================================================
+# Development/testing code (run with: python gdn_kernel_dev.py)
+# ============================================================================
 
-for name in spatial_blocks:
-    schedule_spatial_fallback(sch, name)
-
-# Schedule g_cumsum (5D with reduction on last axis) ---
-# Loops: b, nv, num_chunks, chunk_size, chunk_size(R)
-schedule_reduction_fallback(sch, "g_cumsum")
-
-
-def schedule_6d_batched_matmul(sch, block_name, spatial_dim_names, reduction_name):
-    """
-    Schedule a 6D batched matmul: (b, nv, nc, d1, d2, r)
-    Strategy: bind b->blockIdx.x, nv->blockIdx.y, nc->blockIdx.z,
-              fuse d1*d2 -> split to threads, keep r as serial reduction
-    """
-    block = sch.get_sblock(block_name)
-    loops = sch.get_loops(block)
-
-    # Unpack: b, nv, nc, d1, d2, r
-    b, nv, nc = loops[0], loops[1], loops[2]
-    d1, d2 = loops[3], loops[4]
-    r = loops[5]
-
-    sch.bind(b, "blockIdx.x")
-    sch.bind(nv, "blockIdx.y")
-    sch.bind(nc, "blockIdx.z")
-
-    # Fuse the two constant spatial dims and split to threads
-    d1_d2 = sch.fuse(d1, d2)
-    d1_d2_o, d1_d2_i = sch.split(d1_d2, factors=[None, MAX_THREADS])
-    sch.bind(d1_d2_o, "vthread.x")
-    sch.bind(d1_d2_i, "threadIdx.x")
-
-    # Decompose reduction
-    sch.decompose_reduction(block, r)
-
-
-# manually schedule the high dim batched matmuls
-# Pattern: (batch, heads, chunks, dim1, dim2, reduction)
-# Strategy: bind outer 3 dims to blocks, fuse inner 2 constant dims to threads
-
-# attn_mm: (b, nv, nc, c1, c2, kd) where c1=c2=64, kd=128
-schedule_6d_batched_matmul(sch, "attn_mm", ["c1", "c2"], "kd")
-
-# value_attn_vbeta_matmul: (b, nv, nc, c, vd, r) where c=64, vd=128, r=64
-schedule_6d_batched_matmul(sch, "value_attn_vbeta_matmul", ["c", "vd"], "r")
-
-# k_cumdecay_mm: (b, nv, nc, c, kd, r) where c=64, kd=128, r=64
-schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
-
-# recurrent_state_mm_1_out: (b, nv, nc, c1, c2, r)
-schedule_6d_batched_matmul(sch, "recurrent_state_mm_1", ["c1", "c2"], "r")
-
-
-# Apply is_scheduled attribute so dlight/default GPU schedule skips this
-mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
-
-print("\n\n=== manually scheduled tir  ===")
-mod.show()
-
-
-# Try to build to CUDA
-print("\n\n=== Attempting tvm.build to CUDA ===")
-try:
-    built = tvm.build(mod, target=target)
-    print("BUILD SUCCEEDED")
-    # Print generated CUDA source
-    cuda_src = built.imports[0].inspect_source()
-    print(cuda_src)
-except Exception as e:
-    print(f"BUILD FAILED: {type(e).__name__}: {e}")
+if __name__ == "__main__":
+    # Example usage: build and test the kernels
+    print("=== Building kernels for development ===\n")
+    
+    # Build causal conv1d
+    print("Building causal_conv1d_update...")
+    try:
+        conv1d_kernel = build_causal_conv1d_update(
+            hidden_size=128,
+            state_len=3,
+            has_bias=True,
+            activation="silu",
+        )
+        print("✓ causal_conv1d_update built successfully\n")
+    except Exception as e:
+        print(f"✗ causal_conv1d_update failed: {e}\n")
+    
+    # Build chunk gated delta rule
+    print("Building chunk_gated_delta_rule...")
+    try:
+        chunk_kernel = build_chunk_gated_delta_rule(
+            linear_num_value_heads=32,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            chunk_size=64,
+        )
+        print("✓ chunk_gated_delta_rule built successfully\n")
+        
+        # Print generated CUDA source for inspection
+        print("=== Generated CUDA source (first 2000 chars) ===")
+        cuda_src = chunk_kernel.imports[0].inspect_source()
+        print(cuda_src[:2000])
+        print("...\n")
+    except Exception as e:
+        print(f"✗ chunk_gated_delta_rule failed: {e}\n")
