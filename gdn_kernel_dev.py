@@ -226,6 +226,24 @@ def _chunk_gated_delta_rule(
         seq_len = T.int64()
         T.evaluate(T.assume(seq_len > 0))
         T.evaluate(T.assume(batch_size > 0))
+        # output buffers
+        recurrent_state_out_buf = T.match_buffer(
+            recurrent_state_out,
+            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        
+        core_attn_out_buf = T.match_buffer(
+            core_attn_out,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_value_head_dim,
+            ),
+            dtype=_dtype,
+        )
         # input buffers
         query_buf = T.match_buffer(
             query,
@@ -480,20 +498,41 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
-        recurrent_state_update_vprime_out = T.alloc_buffer(
+        recurrent_state_update_v_buf = T.alloc_buffer(
             (
                 batch_size,
                 _linear_num_value_heads,
                 (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
                 _chunk_size,
-                _linear_value_head_dim
-                ), dtype=_dtype,
+                _linear_value_head_dim,
+            ),
+            dtype=_dtype,
+        )
+
+        recurrent_state_update_attn_inter = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_value_head_dim,
+            ),
+            dtype=_dtype,
         )
 
         padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
         padded_len = seq_len + padding
         num_chunks = padded_len // _chunk_size
         # TODO: conditional l2 norm of q, k here
+
+
+        # TODO: copy the recurrent_state_buf to the recurrent_state_out_buf as an init step
+        for b, nv, kd, vd in T.grid(
+                batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
+                ):
+            with T.sblock("copy_last_recurrent_to_out"):
+                vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b,nv,kd,vd])
+                recurrent_state_out_buf[vb, vnv, vkd, vvd] = last_recurrent_state_buf[vb, vnv, vkd, vvd]
 
         # transpose, pad, scale query
         for b, s, nv, kd in T.grid(
@@ -803,22 +842,58 @@ def _chunk_gated_delta_rule(
                     ),
                     T.float32(0.0),
                 )
-        for b, nv, nc, c, vd, r in T.grid(
-                batch_size,
-                _linear_num_value_heads,
-                num_chunks,
-                _chunk_size,
-                _linear_value_head_dim,
-                _linear_key_head_dim
-        ):
-            with T.sblock("recurrent_state_mm_2"):
-                vb, vnv, vnc, vc, vvd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, vd, r])
-                with T.init():
-                    recurrent_state_update_vprime_out[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
-                
-                recurrent_state_update_vprime_out[vb, vnv, vnc, vc, vvd] += (
-                        k_cumdecay[vb, vnv, vnc, vc, vr] * last_recurrent_state_buf[vb, vnv, vr, vvd]
-                )
+
+        # Sequential inter-chunk loop
+        # Parallelize over (batch, heads), serialize over chunks for recurrent state dependency
+        # Each element within the chunk (chunk_size) can be done in parallel though.
+        for b in T.thread_binding(batch_size, thread="blockIdx.x"):
+            for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
+                for c in T.thread_binding(_chunk_size, thread="threadIdx.x"):
+                    for i in T.serial(num_chunks):
+                    # v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+                    # Shape: k_cumdecay[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
+                    #        -> v_prime[b, nv, i, chunk_size, value_dim]
+                        for vd in T.serial(_linear_value_head_dim):
+                            # Initialize v_prime for this (c, vd) position
+                            recurrent_state_update_v_buf[b, nv, i, c, vd] = T.float32(0.0)
+                            # Reduction over key_dim
+                            for kd in T.serial(_linear_key_head_dim):
+                                recurrent_state_update_v_buf[b, nv, i, c, vd] += (
+                                    k_cumdecay[b, nv, i, c, kd]
+                                    * recurrent_state_out_buf[b, nv, kd, vd]
+                                )
+                            # calculate the v_new in place: v_new = v_i - v_prime
+                            # where v_i is v[:,:,i]
+                            for kd in T.serial(_linear_key_head_dim):
+                                recurrent_state_update_v_buf[b, nv, i, c, vd] = (
+                                    value_attn_vbeta_matmul_out[b, nv, i, c, vd]
+                                    - recurrent_state_update_v_buf[b, nv, i, c, vd]
+                                )
+                        for vd in T.serial(_linear_value_head_dim):
+                            # (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+                            # initialize this position
+                            recurrent_state_update_attn_inter[b, nv, i, c, vd] = T.float32(0.0)
+                            # reduction over key dim with inlined elemw matrix
+                            for kd in T.serial(_linear_key_head_dim):
+                                elemw = query_chunked[b, nv, i, c, kd] * T.exp(
+                                    g_cumsum[b, nv, i, c]
+                                )
+                                recurrent_state_update_attn_inter[b, nv, i, c, vd] += (
+                                    elemw * recurrent_state_out_buf[b, nv, kd, vd]
+                                )
+                        
+                        for vd in T.serial(_linear_value_head_dim):
+                            # compute core_attn_out
+                            # initialize to the attn_inter value
+                            core_attn_out_buf[b, nv, i, c, vd] = recurrent_state_update_attn_inter[b, nv, i, c, vd]
+
+                            for r in T.serial(_chunk_size):
+                                attn_val = attn_identity_add_out[b, nv, i, c, r]
+                                v_new_val = recurrent_state_update_v_buf[b, nv, i, r, vd]
+                                core_attn_out_buf[b, nv, i, c, vd] += attn_val * v_new_val
+
+                        # TODO: update recurrent state in place (recurrent_state_out_buf)
+                        
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -897,6 +972,7 @@ def schedule_reduction_fallback(sch, block_name):
 
 # --- Schedule all spatial blocks (pure element-wise / transpose / pad / reshape) ---
 spatial_blocks = [
+    "copy_last_recurrent_to_out",
     "transpose_qk_scale_q",
     "pad_fill_qk",
     "transpose_v",
@@ -967,8 +1043,6 @@ schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
 # recurrent_state_mm_1_out: (b, nv, nc, c1, c2, r)
 schedule_6d_batched_matmul(sch, "recurrent_state_mm_1", ["c1", "c2"], "r")
 
-# recurrent_state_mm_2:
-schedule_6d_batched_matmul(sch,"recurrent_state_mm_2", ["c", "vd"], "r")
 
 # Apply is_scheduled attribute so dlight/default GPU schedule skips this
 mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
