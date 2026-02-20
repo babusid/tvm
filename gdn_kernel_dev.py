@@ -848,8 +848,8 @@ def _chunk_gated_delta_rule(
         # Each element within the chunk (chunk_size) can be done in parallel though.
         for b in T.thread_binding(batch_size, thread="blockIdx.x"):
             for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
-                for c in T.thread_binding(_chunk_size, thread="threadIdx.x"):
-                    for i in T.serial(num_chunks):
+                for i in T.serial(num_chunks):  # Sequential over chunks - moved outside thread binding
+                    for c in T.thread_binding(_chunk_size, thread="threadIdx.x"):
                     # v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
                     # Shape: k_cumdecay[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
                     #        -> v_prime[b, nv, i, chunk_size, value_dim]
@@ -892,7 +892,33 @@ def _chunk_gated_delta_rule(
                                 v_new_val = recurrent_state_update_v_buf[b, nv, i, r, vd]
                                 core_attn_out_buf[b, nv, i, c, vd] += attn_val * v_new_val
 
-                        # TODO: update recurrent state in place (recurrent_state_out_buf)
+                    # Update recurrent state after processing chunk i
+                    # PyTorch: last_recurrent_state = last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                    #          + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+                    for kd in T.serial(_linear_key_head_dim):
+                        for vd in T.serial(_linear_value_head_dim):
+                            # Part 1: Decay old state by exp(g[i, -1])
+                            # g_cumsum[b, nv, i, chunk_size-1] is the cumulative sum at the last position
+                            g_last = g_cumsum[b, nv, i, _chunk_size - 1]
+                            recurrent_state_out_buf[b, nv, kd, vd] = (
+                                recurrent_state_out_buf[b, nv, kd, vd] * T.exp(g_last)
+                            )
+                            
+                            # Part 2: Add contribution from current chunk: k.T @ (v_new * decay)
+                            # decay[c_pos] = exp(g[i, -1] - g[i, c_pos]) for each position c_pos in chunk
+                            # This is an outer product reduction: sum over chunk positions
+                            for c_pos in T.serial(_chunk_size):
+                                # Compute decay factor for this position
+                                g_curr = g_cumsum[b, nv, i, c_pos]
+                                decay_factor = T.exp(g_last - g_curr)
+                                
+                                # k[c_pos, kd] * (v_new[c_pos, vd] * decay_factor)
+                                k_val = key_chunked[b, nv, i, c_pos, kd]
+                                v_new_val = recurrent_state_update_v_buf[b, nv, i, c_pos, vd]
+                                
+                                recurrent_state_out_buf[b, nv, kd, vd] += (
+                                    k_val * v_new_val * decay_factor
+                                )
                         
 
     if use_qk_l2norm_in_kernel:
