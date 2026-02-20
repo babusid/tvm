@@ -195,14 +195,6 @@ def _chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     dtype: str = "float32",
 ):
-    """
-    Strategy for prefix scan:
-      - Use T.grid(batch, heads, chunks) for independent dimensions
-      - Use bare range() loops for the sequential row scan (i) and inner (j, k)
-      - Accumulate directly into output buffer locations to avoid the
-        local-variable-mutation bug (where TVMScript creates new let-bindings
-        instead of mutating).
-    """
 
     # Capture compile-time constants
     _linear_num_value_heads = linear_num_value_heads
@@ -220,7 +212,14 @@ def _chunk_gated_delta_rule(
 
     @T.prim_func
     def chunk_gated_delta_rule(
-        query: T.handle, key: T.handle, value: T.handle, g: T.handle, beta: T.handle
+        query: T.handle,
+        key: T.handle,
+        value: T.handle,
+        g: T.handle,
+        beta: T.handle,
+        last_recurrent_state: T.handle,
+        core_attn_out: T.handle,
+        recurrent_state_out: T.handle,
     ):
         # only known at runtime
         batch_size = T.int64()
@@ -244,6 +243,17 @@ def _chunk_gated_delta_rule(
         g_buf = T.match_buffer(g, (batch_size, seq_len, _linear_num_value_heads), dtype=_dtype)
         beta_buf = T.match_buffer(
             beta, (batch_size, seq_len, _linear_num_value_heads), dtype=_dtype
+        )
+
+        last_recurrent_state_buf = T.match_buffer(
+            last_recurrent_state,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                _linear_key_head_dim,
+                _linear_value_head_dim,
+            ),
+            dtype=_dtype,
         )
 
         # intermediate buffers have to be at root level, cant declare them later
@@ -456,7 +466,28 @@ def _chunk_gated_delta_rule(
                 (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
                 _chunk_size,
                 _linear_key_head_dim,
-            )
+            ),
+            dtype=_dtype,
+        )
+        recurrent_state_update_attn_out = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+
+        recurrent_state_update_vprime_out = T.alloc_buffer(
+            (
+                batch_size,
+                _linear_num_value_heads,
+                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                _chunk_size,
+                _linear_value_head_dim
+                ), dtype=_dtype,
         )
 
         padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
@@ -739,7 +770,55 @@ def _chunk_gated_delta_rule(
                 with T.init():
                     k_cumdecay[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
 
-                k_cumdecay[vb, vnv, vnc, vc, vkd] += attn_identity_add_out[vb, vnv, vnc, vc, vr] * k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vr, vkd]
+                k_cumdecay[vb, vnv, vnc, vc, vkd] += (
+                    attn_identity_add_out[vb, vnv, vnc, vc, vr]
+                    * k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vr, vkd]
+                )
+
+        # for i in range(0, total_sequence_length // chunk_size):
+        #   q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        #   attn = (q_i @ k_i.transpose(-1,-2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        for b, nv, nc, c1, c2, r in T.grid(
+            batch_size,
+            _linear_num_value_heads,
+            num_chunks,
+            _chunk_size,
+            _chunk_size,
+            _linear_key_head_dim,
+        ):
+            with T.sblock("recurrent_state_mm_1"):
+                vb, vnv, vnc, vc1, vc2, vr = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, r])
+                with T.init():
+                    recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+
+                recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
+                    vc2 < vc1,
+                    (
+                        recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2]
+                        + (
+                            query_chunked[vb, vnv, vnc, vc1, vr]
+                            * key_chunked[vb, vnv, vnc, vc2, vr]
+                        )
+                        * decay_mask[vb, vnv, vnc, vc1, vc2]
+                    ),
+                    T.float32(0.0),
+                )
+        for b, nv, nc, c, vd, r in T.grid(
+                batch_size,
+                _linear_num_value_heads,
+                num_chunks,
+                _chunk_size,
+                _linear_value_head_dim,
+                _linear_key_head_dim
+        ):
+            with T.sblock("recurrent_state_mm_2"):
+                vb, vnv, vnc, vc, vvd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, vd, r])
+                with T.init():
+                    recurrent_state_update_vprime_out[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                
+                recurrent_state_update_vprime_out[vb, vnv, vnc, vc, vvd] += (
+                        k_cumdecay[vb, vnv, vnc, vc, vr] * last_recurrent_state_buf[vb, vnv, vr, vvd]
+                )
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -843,6 +922,7 @@ for name in spatial_blocks:
 # Loops: b, nv, num_chunks, chunk_size, chunk_size(R)
 schedule_reduction_fallback(sch, "g_cumsum")
 
+
 def schedule_6d_batched_matmul(sch, block_name, spatial_dim_names, reduction_name):
     """
     Schedule a 6D batched matmul: (b, nv, nc, d1, d2, r)
@@ -851,22 +931,22 @@ def schedule_6d_batched_matmul(sch, block_name, spatial_dim_names, reduction_nam
     """
     block = sch.get_sblock(block_name)
     loops = sch.get_loops(block)
-    
+
     # Unpack: b, nv, nc, d1, d2, r
     b, nv, nc = loops[0], loops[1], loops[2]
     d1, d2 = loops[3], loops[4]
     r = loops[5]
-    
+
     sch.bind(b, "blockIdx.x")
     sch.bind(nv, "blockIdx.y")
     sch.bind(nc, "blockIdx.z")
-    
+
     # Fuse the two constant spatial dims and split to threads
     d1_d2 = sch.fuse(d1, d2)
     d1_d2_o, d1_d2_i = sch.split(d1_d2, factors=[None, MAX_THREADS])
     sch.bind(d1_d2_o, "vthread.x")
     sch.bind(d1_d2_i, "threadIdx.x")
-    
+
     # Decompose reduction
     sch.decompose_reduction(block, r)
 
@@ -883,6 +963,12 @@ schedule_6d_batched_matmul(sch, "value_attn_vbeta_matmul", ["c", "vd"], "r")
 
 # k_cumdecay_mm: (b, nv, nc, c, kd, r) where c=64, kd=128, r=64
 schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
+
+# recurrent_state_mm_1_out: (b, nv, nc, c1, c2, r)
+schedule_6d_batched_matmul(sch, "recurrent_state_mm_1", ["c1", "c2"], "r")
+
+# recurrent_state_mm_2:
+schedule_6d_batched_matmul(sch,"recurrent_state_mm_2", ["c", "vd"], "r")
 
 # Apply is_scheduled attribute so dlight/default GPU schedule skips this
 mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
