@@ -232,7 +232,7 @@ def _chunk_gated_delta_rule(
             (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
             dtype=_dtype,
         )
-
+        
         # Final output shape: (batch, seq_len, heads, value_dim)
         # This is after unchunking, removing padding, and transposing
         core_attn_out_buf = T.match_buffer(
@@ -276,7 +276,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
@@ -285,7 +286,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
@@ -294,7 +296,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
@@ -303,7 +306,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_value_head_dim,
             ),
             dtype=_dtype,
@@ -312,7 +316,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_value_head_dim,
             ),
             dtype=_dtype,
@@ -321,7 +326,8 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
             ),
             dtype=_dtype,
         )
@@ -329,15 +335,18 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
+                tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
             ),
             dtype=_dtype,
         )
+
+        # Use ceildiv for tir.ceildiv(seq_len, _chunk_size) - avoids negative modulo issues in generated code
         query_chunked = T.alloc_buffer(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_key_head_dim,
             ),
@@ -347,7 +356,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_key_head_dim,
             ),
@@ -357,7 +366,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             ),
@@ -367,7 +376,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_key_head_dim,
             ),
@@ -377,7 +386,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             ),
@@ -387,7 +396,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
             ),
             dtype=_dtype,
@@ -396,7 +405,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
             ),
             dtype=_dtype,
@@ -405,7 +414,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -415,7 +424,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -425,7 +434,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -435,7 +444,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -446,7 +455,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -457,7 +466,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             )
@@ -467,7 +476,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_key_head_dim,
             ),
@@ -477,7 +486,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_key_head_dim,
             ),
@@ -487,7 +496,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _chunk_size,
             ),
@@ -498,7 +507,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             ),
@@ -509,7 +518,7 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             ),
@@ -522,27 +531,28 @@ def _chunk_gated_delta_rule(
             (
                 batch_size,
                 _linear_num_value_heads,
-                (seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size)) // _chunk_size,
+                tir.ceildiv(seq_len, _chunk_size),
                 _chunk_size,
                 _linear_value_head_dim,
             ),
             dtype=_dtype,
         )
 
-        padding = (_chunk_size - seq_len % _chunk_size) % _chunk_size
-        padded_len = seq_len + padding
-        num_chunks = padded_len // _chunk_size
         # TODO: conditional l2 norm of q, k here
+        
+        # Compute padding size for fill operations
+        # Use ceildiv to avoid TVM generating negative modulo expressions
+        padded_len = tir.ceildiv(seq_len, _chunk_size) * _chunk_size
+        padding = padded_len - seq_len
+
 
         # TODO: copy the recurrent_state_buf to the recurrent_state_out_buf as an init step
         for b, nv, kd, vd in T.grid(
-            batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
-        ):
+                batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
+                ):
             with T.sblock("copy_last_recurrent_to_out"):
-                vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b, nv, kd, vd])
-                recurrent_state_out_buf[vb, vnv, vkd, vvd] = last_recurrent_state_buf[
-                    vb, vnv, vkd, vvd
-                ]
+                vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b,nv,kd,vd])
+                recurrent_state_out_buf[vb, vnv, vkd, vvd] = last_recurrent_state_buf[vb, vnv, vkd, vvd]
 
         # transpose, pad, scale query
         for b, s, nv, kd in T.grid(
@@ -669,7 +679,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, c, r in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
         ):
@@ -686,7 +696,7 @@ def _chunk_gated_delta_rule(
         for b, nv, s, c1, c2 in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
         ):
@@ -708,7 +718,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c1, c2, kd in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
             _linear_key_head_dim,
@@ -725,7 +735,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c1, c2 in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
         ):
@@ -743,7 +753,7 @@ def _chunk_gated_delta_rule(
         # Using explicit thread_binding here since s_tir.Schedule API doesn't support triangular bounds?
         for b in T.thread_binding(batch_size, thread="blockIdx.x"):
             for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
-                for nc in T.thread_binding(num_chunks, thread="threadIdx.x"):
+                for nc in T.thread_binding(tir.ceildiv(seq_len, _chunk_size), thread="threadIdx.x"):
                     # Sequential scan over rows - each row i depends on rows 0..i-1
                     for i in T.serial(1, _chunk_size):
                         # For each column j in row i (j < i for lower triangular)
@@ -764,7 +774,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c1, c2 in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
         ):
@@ -778,7 +788,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c, vd, r in T.grid(
             batch_size,
             _linear_value_head_dim,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _linear_value_head_dim,
             _chunk_size,
@@ -798,7 +808,7 @@ def _chunk_gated_delta_rule(
         # k_beta_chunked
         # g_cumsum
         for b, nv, nc, c, vd in T.grid(
-            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_value_head_dim
+            batch_size, _linear_num_value_heads, tir.ceildiv(seq_len, _chunk_size), _chunk_size, _linear_value_head_dim
         ):
             with T.sblock("k_cumdecay_internal"):
                 vb, vnv, vnc, vc, vvd = T.axis.remap("SSSSS", [b, nv, nc, c, vd])
@@ -809,7 +819,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c, kd, r in T.grid(
             batch_size,
             _linear_value_head_dim,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _linear_key_head_dim,
             _chunk_size,
@@ -830,7 +840,7 @@ def _chunk_gated_delta_rule(
         for b, nv, nc, c1, c2, r in T.grid(
             batch_size,
             _linear_num_value_heads,
-            num_chunks,
+            tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _chunk_size,
             _linear_key_head_dim,
@@ -1055,6 +1065,27 @@ def build_chunk_gated_delta_rule(
         sch_local.bind(bx, "blockIdx.x")
         sch_local.bind(tx, "threadIdx.x")
     
+    def schedule_padding_block(sch_local, block_name):
+        """Specialized scheduling for padding blocks to avoid fusing symbolic padding dimension."""
+        block = sch_local.get_sblock(block_name)
+        loops = sch_local.get_loops(block)
+        # Padding blocks have structure: (batch, num_heads, padding, dim)
+        # Don't fuse the 'padding' dimension (symbolic expression)
+        if len(loops) == 4:
+            b, nv, s, d = loops
+            # Fuse only batch and num_heads
+            fused = sch_local.fuse(b, nv)
+            sch_local.bind(fused, "blockIdx.x")
+            # Keep padding dimension serial (it's typically small: 0-63)
+            # Bind the inner constant dimension to threads
+            sch_local.bind(d, "threadIdx.x")
+        elif len(loops) == 3:
+            # For pad_fill_gb: (batch, num_heads, padding)
+            b, nv, s = loops
+            fused = sch_local.fuse(b, nv)
+            sch_local.bind(fused, "blockIdx.x")
+            # Keep padding dimension serial
+    
     def schedule_reduction_fallback(sch_local, block_name):
         """Fallback scheduling for reduction blocks."""
         block = sch_local.get_sblock(block_name)
@@ -1087,11 +1118,8 @@ def build_chunk_gated_delta_rule(
     spatial_blocks = [
         "copy_last_recurrent_to_out",
         "transpose_qk_scale_q",
-        "pad_fill_qk",
         "transpose_v",
-        "pad_fill_v",
         "transpose_gb",
-        "pad_fill_gb",
         "v_beta",
         "k_beta",
         "chunk_reshape_q_k_kbeta",
@@ -1104,8 +1132,17 @@ def build_chunk_gated_delta_rule(
         "transform_output",
     ]
     
+    padding_blocks = [
+        "pad_fill_qk",
+        "pad_fill_v",
+        "pad_fill_gb",
+    ]
+    
     for name in spatial_blocks:
         schedule_spatial_fallback(sch, name)
+    
+    for name in padding_blocks:
+        schedule_padding_block(sch, name)
     
     schedule_reduction_fallback(sch, "g_cumsum")
     
@@ -1140,6 +1177,11 @@ if __name__ == "__main__":
             activation="silu",
         )
         print("✓ causal_conv1d_update built successfully\n")
+        print("=== Generated CUDA source ===")
+        cuda_src = conv1d_kernel.imports[0].inspect_source()
+        print(cuda_src)
+        print("...\n")
+
     except Exception as e:
         print(f"✗ causal_conv1d_update failed: {e}\n")
     
@@ -1156,9 +1198,9 @@ if __name__ == "__main__":
         print("✓ chunk_gated_delta_rule built successfully\n")
         
         # Print generated CUDA source for inspection
-        print("=== Generated CUDA source (first 2000 chars) ===")
+        print("=== Generated CUDA source ===")
         cuda_src = chunk_kernel.imports[0].inspect_source()
-        print(cuda_src[:2000])
+        print(cuda_src)
         print("...\n")
     except Exception as e:
         print(f"✗ chunk_gated_delta_rule failed: {e}\n")
