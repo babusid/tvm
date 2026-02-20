@@ -818,7 +818,7 @@ def _chunk_gated_delta_rule(
 
         for b, nv, nc, c, kd, r in T.grid(
             batch_size,
-            _linear_value_head_dim,
+            _linear_num_value_heads,
             tir.ceildiv(seq_len, _chunk_size),
             _chunk_size,
             _linear_key_head_dim,
