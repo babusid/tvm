@@ -319,46 +319,198 @@ if __name__ == "__main__":
     print("GatedDeltaNet TVM Kernel Test Suite")
     print("=" * 70)
 
+    # Test configuration dictionary
+    # Key: test_name (string)
+    # Value: tuple of (test_func, num_iterations, kwargs_dict)
+    TEST_CONFIGS = {
+        "causal_conv1d_update_baseline": (
+            test_causal_conv1d_update,
+            5,
+            {
+                "batch_size": 2,
+                "hidden_size": 128,
+                "seq_len": 4,
+                "state_len": 3,
+                "rtol": 1e-4,
+                "atol": 1e-4,
+            },
+        ),
+        # Baseline test - power of 2 batch/seq_len
+        "chunk_gated_delta_rule_baseline": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 128,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Non-power-of-2 batch size (3)
+        "chunk_gated_delta_rule_batch3": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 3,
+                "seq_len": 128,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Non-power-of-2 batch size (5) - upper realistic limit
+        "chunk_gated_delta_rule_batch5": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 5,
+                "seq_len": 128,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Short sequence - single chunk (64 tokens)
+        "chunk_gated_delta_rule_seq64": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 64,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Non-power-of-2 sequence length (100 tokens, needs padding)
+        "chunk_gated_delta_rule_seq100": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 100,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Non-power-of-2 sequence length (200 tokens)
+        "chunk_gated_delta_rule_seq200": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 200,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Longer sequence - 512 tokens (8 chunks)
+        "chunk_gated_delta_rule_seq512": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 512,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Non-power-of-2 + longer (333 tokens, ~5.2 chunks)
+        "chunk_gated_delta_rule_seq333": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 333,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Combined: non-power-of-2 batch (3) + non-power-of-2 seq (150)
+        "chunk_gated_delta_rule_batch3_seq150": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 3,
+                "seq_len": 150,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+        # Edge case: batch=1 (single sequence inference)
+        "chunk_gated_delta_rule_batch1_seq256": (
+            test_chunk_gated_delta_rule,
+            5,
+            {
+                "batch_size": 1,
+                "seq_len": 256,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "chunk_size": 64,
+                "rtol": 5e-3,
+                "atol": 5e-3,
+            },
+        ),
+    }
+
     results = {}
 
-    # Test 1: causal_conv1d_update
-    for i in range(10):
-        try:
-            results[f"causal_conv1d_update_{i}"] = test_causal_conv1d_update(
-                batch_size=2,
-                hidden_size=128,
-                seq_len=4,
-                state_len=3,
-                rtol=1e-4,
-                atol=1e-4,
-            )
-        except Exception as e:
-            print(f"\n✗ causal_conv1d_update_{i} crashed: {e}")
-            import traceback
-            traceback.print_exc()
-            results["causal_conv1d_update_{i}"] = False
-    
-    # Test 2: chunk_gated_delta_rule - baseline (batch_size=2, seq_len=128)
-    for i in range(10):
-        try:
-            results[f"chunk_gated_delta_rule_baseline_{i}"] = test_chunk_gated_delta_rule(
-                batch_size=2,
-                seq_len=128,
-                num_v_heads=32,
-                v_head_dim=128,
-                num_k_heads=16,
-                k_head_dim=128,
-                chunk_size=64,
-                rtol=5e-3,
-                atol=5e-3,
-            )
-        except Exception as e:
-            print(f"\n✗ chunk_gated_delta_rule_baseline_{i} crashed: {e}")
-            import traceback
+    # Run all test configurations
+    for test_name, (test_func, num_iterations, test_kwargs) in TEST_CONFIGS.items():
+        for iteration in range(num_iterations):
+            test_instance_name = f"{test_name}_iter{iteration}"
+            try:
+                results[test_instance_name] = test_func(**test_kwargs)
+            except Exception as e:
+                print(f"\n✗ {test_instance_name} crashed: {e}")
+                import traceback
 
-            traceback.print_exc()
-            results[f"chunk_gated_delta_rule_baseline_{i}"] = False
-
+                traceback.print_exc()
+                results[test_instance_name] = False
 
     # Summary
     print("\n" + "=" * 70)
