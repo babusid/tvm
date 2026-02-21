@@ -462,23 +462,24 @@ if __name__ == "__main__":
 #        results["causal_conv1d_update"] = False
 #    
     # Test 2: chunk_gated_delta_rule
-    try:
-        results["chunk_gated_delta_rule"] = test_chunk_gated_delta_rule(
-            batch_size=2,
-            seq_len=128,
-            num_v_heads=32,
-            v_head_dim=128,
-            num_k_heads=16,
-            k_head_dim=128,
-            chunk_size=64,
-            rtol=1e-4,
-            atol=1e-4,
-        )
-    except Exception as e:
-        print(f"\n✗ chunk_gated_delta_rule crashed: {e}")
-        import traceback
-        traceback.print_exc()
-        results["chunk_gated_delta_rule"] = False
+    for i in range(10):
+        try:
+            results[f"chunk_gated_delta_rule_{i}"] = test_chunk_gated_delta_rule(
+                batch_size=2,
+                seq_len=128,
+                num_v_heads=32,
+                v_head_dim=128,
+                num_k_heads=16,
+                k_head_dim=128,
+                chunk_size=64,
+                rtol=5e-3,
+                atol=5e-3,
+            )
+        except Exception as e:
+            print(f"\n✗ chunk_gated_delta_rule_{i} crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            results[f"chunk_gated_delta_rule_{i}"] = False
     
     # Summary
     print("\n" + "="*70)

@@ -1049,8 +1049,9 @@ def build_causal_conv1d_update(
     # Apply dlight scheduling for GPU
     with target_obj:
         mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
-    
-    built = tvm.build(mod, target=target_obj)
+
+    with tvm.transform.PassContext(config={"tir.disable_storage_rewrite": True}):
+        built = tir.build(mod, target=target_obj)
     return built
 
 
@@ -1195,7 +1196,8 @@ def build_chunk_gated_delta_rule(
     mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
     
     target_obj = tvm.target.Target(target)
-    built = tvm.build(mod, target=target_obj)
+    with tvm.transform.PassContext(config={"tir.disable_storage_rewrite": True}):
+        built = tir.build(mod, target=target_obj)
     return built
 
 
