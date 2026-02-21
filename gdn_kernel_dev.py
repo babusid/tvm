@@ -220,6 +220,33 @@ def _chunk_gated_delta_rule(
         last_recurrent_state: T.handle,
         core_attn_out: T.handle,
         recurrent_state_out: T.handle,
+        # Intermediate buffers (externalized for debugging)
+        query_T: T.handle,
+        key_T: T.handle,
+        k_beta: T.handle,
+        value_T: T.handle,
+        v_beta: T.handle,
+        g_T: T.handle,
+        beta_T: T.handle,
+        query_chunked: T.handle,
+        key_chunked: T.handle,
+        value_chunked: T.handle,
+        k_beta_chunked: T.handle,
+        v_beta_chunked: T.handle,
+        g_chunked: T.handle,
+        g_cumsum: T.handle,
+        decay_mask: T.handle,
+        attn_mm_out: T.handle,
+        attn_decay_neg_mask_out: T.handle,
+        attn_associative_scan_out: T.handle,
+        attn_identity_add_out: T.handle,
+        value_attn_vbeta_matmul_out: T.handle,
+        k_beta_x_g_cumsum_exp_tmp: T.handle,
+        k_cumdecay: T.handle,
+        recurrent_state_update_attn_out: T.handle,
+        recurrent_state_update_v_buf: T.handle,
+        recurrent_state_update_attn_inter: T.handle,
+        core_attn_out_inter: T.handle,
     ):
         # only known at runtime
         batch_size = T.int64()
@@ -270,79 +297,78 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
-        # intermediate buffers have to be at root level, cant declare them later
-        # pad_size = (_chunk_size - seq_len % _chunk_size) % _chunk_size
-        query_T = T.alloc_buffer(
+        # intermediate buffers - externalized for debugging
+        query_T_buf = T.match_buffer(
+            query_T,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
         )
-        key_T = T.alloc_buffer(
+        key_T_buf = T.match_buffer(
+            key_T,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
         )
-        k_beta = T.alloc_buffer(
+        k_beta_buf = T.match_buffer(
+            k_beta,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_key_head_dim,
             ),
             dtype=_dtype,
         )
-        value_T = T.alloc_buffer(
+        value_T_buf = T.match_buffer(
+            value_T,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_value_head_dim,
             ),
             dtype=_dtype,
         )
-        v_beta = T.alloc_buffer(
+        v_beta_buf = T.match_buffer(
+            v_beta,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
                 _linear_value_head_dim,
             ),
             dtype=_dtype,
         )
-        g_T = T.alloc_buffer(
+        g_T_buf = T.match_buffer(
+            g_T,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
             ),
             dtype=_dtype,
         )
-        beta_T = T.alloc_buffer(
+        beta_T_buf = T.match_buffer(
+            beta_T,
             (
                 batch_size,
                 _linear_num_value_heads,
-                #seq_len + ((_chunk_size - seq_len % _chunk_size) % _chunk_size),
                 tir.ceildiv(seq_len, _chunk_size)*_chunk_size,
             ),
             dtype=_dtype,
         )
 
-        # Use ceildiv for tir.ceildiv(seq_len, _chunk_size) - avoids negative modulo issues in generated code
-        query_chunked = T.alloc_buffer(
+        query_chunked_buf = T.match_buffer(
+            query_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -352,7 +378,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        key_chunked = T.alloc_buffer(
+        key_chunked_buf = T.match_buffer(
+            key_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -362,7 +389,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        value_chunked = T.alloc_buffer(
+        value_chunked_buf = T.match_buffer(
+            value_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -372,7 +400,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        k_beta_chunked = T.alloc_buffer(
+        k_beta_chunked_buf = T.match_buffer(
+            k_beta_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -382,7 +411,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        v_beta_chunked = T.alloc_buffer(
+        v_beta_chunked_buf = T.match_buffer(
+            v_beta_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -392,7 +422,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        g_chunked = T.alloc_buffer(
+        g_chunked_buf = T.match_buffer(
+            g_chunked,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -401,7 +432,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        g_cumsum = T.alloc_buffer(
+        g_cumsum_buf = T.match_buffer(
+            g_cumsum,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -410,17 +442,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        decay_mask = T.alloc_buffer(
-            (
-                batch_size,
-                _linear_num_value_heads,
-                tir.ceildiv(seq_len, _chunk_size),
-                _chunk_size,
-                _chunk_size,
-            ),
-            dtype=_dtype,
-        )
-        attn_mm_out = T.alloc_buffer(
+        decay_mask_buf = T.match_buffer(
+            decay_mask,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -430,7 +453,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        attn_decay_neg_mask_out = T.alloc_buffer(
+        attn_mm_out_buf = T.match_buffer(
+            attn_mm_out,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -440,7 +464,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-        attn_associative_scan_out = T.alloc_buffer(
+        attn_decay_neg_mask_out_buf = T.match_buffer(
+            attn_decay_neg_mask_out,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -450,8 +475,8 @@ def _chunk_gated_delta_rule(
             ),
             dtype=_dtype,
         )
-
-        attn_identity_add_out = T.alloc_buffer(
+        attn_associative_scan_out_buf = T.match_buffer(
+            attn_associative_scan_out,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -462,37 +487,8 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
-        value_attn_vbeta_matmul_out = T.alloc_buffer(
-            (
-                batch_size,
-                _linear_num_value_heads,
-                tir.ceildiv(seq_len, _chunk_size),
-                _chunk_size,
-                _linear_value_head_dim,
-            )
-        )
-
-        k_beta_x_g_cumsum_exp_tmp = T.alloc_buffer(
-            (
-                batch_size,
-                _linear_num_value_heads,
-                tir.ceildiv(seq_len, _chunk_size),
-                _chunk_size,
-                _linear_key_head_dim,
-            ),
-            dtype=_dtype,
-        )
-        k_cumdecay = T.alloc_buffer(
-            (
-                batch_size,
-                _linear_num_value_heads,
-                tir.ceildiv(seq_len, _chunk_size),
-                _chunk_size,
-                _linear_key_head_dim,
-            ),
-            dtype=_dtype,
-        )
-        recurrent_state_update_attn_out = T.alloc_buffer(
+        attn_identity_add_out_buf = T.match_buffer(
+            attn_identity_add_out,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -503,7 +499,8 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
-        recurrent_state_update_v_buf = T.alloc_buffer(
+        value_attn_vbeta_matmul_out_buf = T.match_buffer(
+            value_attn_vbeta_matmul_out,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -514,7 +511,54 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
 
-        recurrent_state_update_attn_inter = T.alloc_buffer(
+        k_beta_x_g_cumsum_exp_tmp_buf = T.match_buffer(
+            k_beta_x_g_cumsum_exp_tmp,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                tir.ceildiv(seq_len, _chunk_size),
+                _chunk_size,
+                _linear_key_head_dim,
+            ),
+            dtype=_dtype,
+        )
+        k_cumdecay_buf = T.match_buffer(
+            k_cumdecay,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                tir.ceildiv(seq_len, _chunk_size),
+                _chunk_size,
+                _linear_key_head_dim,
+            ),
+            dtype=_dtype,
+        )
+        recurrent_state_update_attn_out_buf = T.match_buffer(
+            recurrent_state_update_attn_out,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                tir.ceildiv(seq_len, _chunk_size),
+                _chunk_size,
+                _chunk_size,
+            ),
+            dtype=_dtype,
+        )
+
+        recurrent_state_update_v_buf_buf = T.match_buffer(
+            recurrent_state_update_v_buf,
+            (
+                batch_size,
+                _linear_num_value_heads,
+                tir.ceildiv(seq_len, _chunk_size),
+                _chunk_size,
+                _linear_value_head_dim,
+            ),
+            dtype=_dtype,
+        )
+
+        recurrent_state_update_attn_inter_buf = T.match_buffer(
+            recurrent_state_update_attn_inter,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -527,7 +571,8 @@ def _chunk_gated_delta_rule(
 
         # Intermediate output buffer in chunked format
         # Will be transformed to final output shape at the end
-        core_attn_out_inter = T.alloc_buffer(
+        core_attn_out_inter_buf = T.match_buffer(
+            core_attn_out_inter,
             (
                 batch_size,
                 _linear_num_value_heads,
@@ -561,10 +606,10 @@ def _chunk_gated_delta_rule(
             with T.sblock("transpose_qk_scale_q"):
                 vb, vs, vnv, vkd = T.axis.remap("SSSS", [b, s, nv, kd])
                 T.reads(query_buf[vb, vs, vnv, vkd], key_buf[vb, vs, vnv, vkd])
-                T.writes(query_T[vb, vnv, vs, vkd], key_T[vb, vnv, vs, vkd])
+                T.writes(query_T_buf[vb, vnv, vs, vkd], key_T_buf[vb, vnv, vs, vkd])
                 # inline scaling of query while doing the transpose
-                query_T[vb, vnv, vs, vkd] = query_buf[vb, vs, vnv, vkd] * _scale
-                key_T[vb, vnv, vs, vkd] = key_buf[vb, vs, vnv, vkd]
+                query_T_buf[vb, vnv, vs, vkd] = query_buf[vb, vs, vnv, vkd] * _scale
+                key_T_buf[vb, vnv, vs, vkd] = key_buf[vb, vs, vnv, vkd]
 
         for b, nv, s, kd in T.grid(
             batch_size,
@@ -574,8 +619,8 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("pad_fill_qk"):
                 vb, vnv, vs, vkd = T.axis.remap("SSSS", [b, nv, s, kd])
-                query_T[vb, vnv, seq_len + vs, vkd] = 0.0
-                key_T[vb, vnv, seq_len + vs, vkd] = 0.0
+                query_T_buf[vb, vnv, seq_len + vs, vkd] = 0.0
+                key_T_buf[vb, vnv, seq_len + vs, vkd] = 0.0
 
         for b, s, nv, vd in T.grid(
             batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim
@@ -583,8 +628,8 @@ def _chunk_gated_delta_rule(
             with T.sblock("transpose_v"):
                 vb, vs, vnv, vvd = T.axis.remap("SSSS", [b, s, nv, vd])
                 T.reads(value_buf[vb, vs, vnv, vvd])
-                T.writes(value_T[vb, vnv, vs, vvd])
-                value_T[vb, vnv, vs, vvd] = value_buf[vb, vs, vnv, vvd]
+                T.writes(value_T_buf[vb, vnv, vs, vvd])
+                value_T_buf[vb, vnv, vs, vvd] = value_buf[vb, vs, vnv, vvd]
 
         for b, nv, s, vd in T.grid(
             batch_size,
@@ -594,15 +639,15 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("pad_fill_v"):
                 vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
-                value_T[vb, vnv, seq_len + vs, vvd] = 0.0
+                value_T_buf[vb, vnv, seq_len + vs, vvd] = 0.0
 
         for b, s, nv in T.grid(batch_size, seq_len, _linear_num_value_heads):
             with T.sblock("transpose_gb"):
                 vb, vs, vnv = T.axis.remap("SSS", [b, s, nv])
                 T.reads(g_buf[vb, vs, vnv], beta_buf[vb, vs, vnv])
-                T.writes(g_T[vb, vnv, vs], beta_T[vb, vnv, vs])
-                g_T[vb, vnv, vs] = g_buf[vb, vs, vnv]
-                beta_T[vb, vnv, vs] = beta_buf[vb, vs, vnv]
+                T.writes(g_T_buf[vb, vnv, vs], beta_T_buf[vb, vnv, vs])
+                g_T_buf[vb, vnv, vs] = g_buf[vb, vs, vnv]
+                beta_T_buf[vb, vnv, vs] = beta_buf[vb, vs, vnv]
 
         for b, nv, s in T.grid(
             batch_size,
@@ -611,8 +656,8 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("pad_fill_gb"):
                 vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
-                g_T[vb, vnv, seq_len + vs] = 0.0
-                beta_T[vb, vnv, seq_len + vs] = 0.0
+                g_T_buf[vb, vnv, seq_len + vs] = 0.0
+                beta_T_buf[vb, vnv, seq_len + vs] = 0.0
 
         for b, nv, s, vd in T.grid(
             batch_size,
@@ -622,7 +667,7 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("v_beta"):
                 vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
-                v_beta[vb, vnv, vs, vvd] = value_T[vb, vnv, vs, vvd] * beta_T[vb, vnv, vs]
+                v_beta_buf[vb, vnv, vs, vvd] = value_T_buf[vb, vnv, vs, vvd] * beta_T_buf[vb, vnv, vs]
 
         for b, nk, s, kd in T.grid(
             batch_size,
@@ -632,7 +677,7 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("k_beta"):
                 vb, vnk, vs, vkd = T.axis.remap("SSSS", [b, nk, s, kd])
-                k_beta[vb, vnk, vs, vkd] = key_T[vb, vnk, vs, vkd] * beta_T[vb, vnk, vs]
+                k_beta_buf[vb, vnk, vs, vkd] = key_T_buf[vb, vnk, vs, vkd] * beta_T_buf[vb, vnk, vs]
 
         for b, nv, s, kd in T.grid(
             batch_size,
@@ -642,13 +687,13 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("chunk_reshape_q_k_kbeta"):
                 vb, vnv, vs, vkd = T.axis.remap("SSSS", [b, nv, s, kd])
-                query_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = query_T[
+                query_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = query_T_buf[
                     vb, vnv, vs, vkd
                 ]
-                key_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = key_T[
+                key_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = key_T_buf[
                     vb, vnv, vs, vkd
                 ]
-                k_beta_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = k_beta[
+                k_beta_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size, vkd] = k_beta_buf[
                     vb, vnv, vs, vkd
                 ]
 
@@ -660,10 +705,10 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock(("chunk_reshape_v_vbeta")):
                 vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
-                value_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = value_T[
+                value_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = value_T_buf[
                     vb, vnv, vs, vvd
                 ]
-                v_beta_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = v_beta[
+                v_beta_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = v_beta_buf[
                     vb, vnv, vs, vvd
                 ]
 
@@ -674,7 +719,7 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("chunk_reshape_g"):
                 vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
-                g_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size] = g_T[vb, vnv, vs]
+                g_chunked_buf[vb, vnv, vs // _chunk_size, vs % _chunk_size] = g_T_buf[vb, vnv, vs]
 
         for b, nv, s, c, r in T.grid(
             batch_size,
@@ -688,9 +733,9 @@ def _chunk_gated_delta_rule(
             with T.sblock("g_cumsum"):
                 vb, vnv, vs, vc, vr = T.axis.remap("SSSSR", [b, nv, s, c, r])
                 with T.init():
-                    g_cumsum[vb, vnv, vs, vc] = T.float32(0.0)
-                g_cumsum[vb, vnv, vs, vc] = g_cumsum[vb, vnv, vs, vc] + T.if_then_else(
-                    vr <= vc, g_chunked[vb, vnv, vs, vr], T.float32(0.0)
+                    g_cumsum_buf[vb, vnv, vs, vc] = T.float32(0.0)
+                g_cumsum_buf[vb, vnv, vs, vc] = g_cumsum_buf[vb, vnv, vs, vc] + T.if_then_else(
+                    vr <= vc, g_chunked_buf[vb, vnv, vs, vr], T.float32(0.0)
                 )
 
         for b, nv, s, c1, c2 in T.grid(
@@ -708,9 +753,9 @@ def _chunk_gated_delta_rule(
                 #       we form a matrix where each i,j cell represents b,v,s,i - b,v,s,j
                 # collapse the tril / exp / tril into just one stage
                 vb, vnv, vs, i, j = T.axis.remap("SSSSS", [b, nv, s, c1, c2])
-                decay_mask[vb, vnv, vs, i, j] = T.if_then_else(
+                decay_mask_buf[vb, vnv, vs, i, j] = T.if_then_else(
                     i >= j,
-                    T.exp(g_cumsum[vb, vnv, vs, i] - g_cumsum[vb, vnv, vs, j]),
+                    T.exp(g_cumsum_buf[vb, vnv, vs, i] - g_cumsum_buf[vb, vnv, vs, j]),
                     T.float32(0.0),
                 )
 
@@ -726,10 +771,10 @@ def _chunk_gated_delta_rule(
             with T.sblock("attn_mm"):
                 vb, vnv, vnc, vc1, vc2, vkd = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, kd])
                 with T.init():
-                    attn_mm_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                    attn_mm_out_buf[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
 
-                attn_mm_out[vb, vnv, vnc, vc1, vc2] += (
-                    k_beta_chunked[vb, vnv, vnc, vc1, vkd] * key_chunked[vb, vnv, vnc, vc2, vkd]
+                attn_mm_out_buf[vb, vnv, vnc, vc1, vc2] += (
+                    k_beta_chunked_buf[vb, vnv, vnc, vc1, vkd] * key_chunked_buf[vb, vnv, vnc, vc2, vkd]
                 )
 
         for b, nv, nc, c1, c2 in T.grid(
@@ -741,10 +786,10 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("attn_decay_neg_mask"):
                 vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
-                attn_decay_neg_mask_out[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
+                attn_decay_neg_mask_out_buf[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
                     vc2 >= vc1,
                     T.float32(0.0),
-                    attn_mm_out[vb, vnv, vnc, vc1, vc2] * (-1 * decay_mask[vb, vnv, vnc, vc1, vc2]),
+                    attn_mm_out_buf[vb, vnv, vnc, vc1, vc2] * (-1 * decay_mask_buf[vb, vnv, vnc, vc1, vc2]),
                 )
 
         # Associative scan: for each row i, update row i using rows 0..i-1
@@ -759,16 +804,17 @@ def _chunk_gated_delta_rule(
                         # For each column j in row i (j < i for lower triangular)
                         for j in T.serial(0, i):
                             # Start with original value
-                            attn_associative_scan_out[b, nv, nc, i, j] = attn_decay_neg_mask_out[
+                            attn_associative_scan_out_buf[b, nv, nc, i, j] = attn_decay_neg_mask_out_buf[
                                 b, nv, nc, i, j
                             ]
                             # selects each element in the row we're on, and the jth element of each each row below
                             # current row. this mirrors the broadcast and elementwise multiply
                             # use inline += to mirror the column sum
+                            # CRITICAL: Must read from PREVIOUS rows (attn_decay_neg_mask_out) not current buffer!
                             for k in T.serial(0, i):
-                                attn_associative_scan_out[b, nv, nc, i, j] += (
-                                    attn_associative_scan_out[b, nv, nc, i, k]
-                                    * attn_associative_scan_out[b, nv, nc, k, j]
+                                attn_associative_scan_out_buf[b, nv, nc, i, j] += (
+                                    attn_decay_neg_mask_out_buf[b, nv, nc, i, k]
+                                    * attn_associative_scan_out_buf[b, nv, nc, k, j]
                                 )
 
         for b, nv, nc, c1, c2 in T.grid(
@@ -780,7 +826,7 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("attn_add_identity"):
                 vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
-                attn_identity_add_out[vb, vnv, vnc, vc1, vc2] = attn_associative_scan_out[
+                attn_identity_add_out_buf[vb, vnv, vnc, vc1, vc2] = attn_associative_scan_out_buf[
                     vb, vnv, vnc, vc1, vc2
                 ] + T.if_then_else(vc2 == vc1, T.float32(1.0), T.float32(0.0))
 
@@ -796,11 +842,11 @@ def _chunk_gated_delta_rule(
             with T.sblock("value_attn_vbeta_matmul"):
                 vb, vnv, vnc, vc, vvd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, vd, r])
                 with T.init():
-                    value_attn_vbeta_matmul_out[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                    value_attn_vbeta_matmul_out_buf[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
 
-                value_attn_vbeta_matmul_out[vb, vnv, vnc, vc, vvd] += (
-                    attn_identity_add_out[vb, vnv, vnc, vc, vr]
-                    * v_beta_chunked[vb, vnv, vnc, vr, vvd]
+                value_attn_vbeta_matmul_out_buf[vb, vnv, vnc, vc, vvd] += (
+                    attn_identity_add_out_buf[vb, vnv, vnc, vc, vr]
+                    * v_beta_chunked_buf[vb, vnv, vnc, vr, vvd]
                 )
 
         # k_cumdecay = attn @ (k_beta x g.exp().unsqueeze(-1))
@@ -812,9 +858,9 @@ def _chunk_gated_delta_rule(
         ):
             with T.sblock("k_cumdecay_internal"):
                 vb, vnv, vnc, vc, vvd = T.axis.remap("SSSSS", [b, nv, nc, c, vd])
-                k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vc, vvd] = k_beta_chunked[
+                k_beta_x_g_cumsum_exp_tmp_buf[vb, vnv, vnc, vc, vvd] = k_beta_chunked_buf[
                     vb, vnv, vnc, vc, vvd
-                ] * T.exp(g_cumsum[vb, vnv, vnc, vc])
+                ] * T.exp(g_cumsum_buf[vb, vnv, vnc, vc])
 
         for b, nv, nc, c, kd, r in T.grid(
             batch_size,
@@ -827,102 +873,96 @@ def _chunk_gated_delta_rule(
             with T.sblock("k_cumdecay_mm"):
                 vb, vnv, vnc, vc, vkd, vr = T.axis.remap("SSSSSR", [b, nv, nc, c, kd, r])
                 with T.init():
-                    k_cumdecay[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+                    k_cumdecay_buf[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
 
-                k_cumdecay[vb, vnv, vnc, vc, vkd] += (
-                    attn_identity_add_out[vb, vnv, vnc, vc, vr]
-                    * k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vr, vkd]
+                k_cumdecay_buf[vb, vnv, vnc, vc, vkd] += (
+                    attn_identity_add_out_buf[vb, vnv, vnc, vc, vr]
+                    * k_beta_x_g_cumsum_exp_tmp_buf[vb, vnv, vnc, vr, vkd]
                 )
 
         # for i in range(0, total_sequence_length // chunk_size):
         #   q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        #   attn = (q_i @ k_i.transpose(-1,-2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        for b, nv, nc, c1, c2, r in T.grid(
-            batch_size,
-            _linear_num_value_heads,
-            tir.ceildiv(seq_len, _chunk_size),
-            _chunk_size,
-            _chunk_size,
-            _linear_key_head_dim,
-        ):
-            with T.sblock("recurrent_state_mm_1"):
-                vb, vnv, vnc, vc1, vc2, vr = T.axis.remap("SSSSSR", [b, nv, nc, c1, c2, r])
-                with T.init():
-                    recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
-
-                recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2] = T.if_then_else(
-                    vc2 < vc1,
-                    (
-                        recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2]
-                        + (
-                            query_chunked[vb, vnv, vnc, vc1, vr]
-                            * key_chunked[vb, vnv, vnc, vc2, vr]
-                        )
-                        * decay_mask[vb, vnv, vnc, vc1, vc2]
-                    ),
-                    T.float32(0.0),
-                )
-
+        #   attn = (q_i @ k_i.transpose(-1,-2) * decay_mask_buf[:, :, i]).masked_fill_(mask, 0)
         # Sequential inter-chunk loop
+        # NOTE: The intra-chunk attention (q @ k.T * decay_mask) is computed fresh inside the loop
+        # for each chunk, so we don't pre-compute it here
         # Parallelize over (batch, heads), serialize over chunks for recurrent state dependency
         # Each element within the chunk (chunk_size) can be done in parallel though.
         for b in T.thread_binding(batch_size, thread="blockIdx.x"):
             for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
-                for i in T.serial(tir.ceildiv(seq_len, _chunk_size)):  # Sequential over chunks - moved outside thread binding
+                for i in T.serial(tir.ceildiv(seq_len, _chunk_size)):  # Sequential over chunks
+                    # First, compute intra-chunk attention for this chunk
+                    # PyTorch line 368: attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+                    # where mask = torch.triu(..., diagonal=1) - masks strictly upper triangular (excludes diagonal)
+                    for c1 in T.thread_binding(_chunk_size, thread="threadIdx.x"):
+                        for c2 in T.serial(_chunk_size):
+                            # Compute q_i @ k_i.T
+                            recurrent_state_update_attn_out_buf[b, nv, i, c1, c2] = T.float32(0.0)
+                            for kd in T.serial(_linear_key_head_dim):
+                                recurrent_state_update_attn_out_buf[b, nv, i, c1, c2] += (
+                                    query_chunked_buf[b, nv, i, c1, kd] 
+                                    * key_chunked_buf[b, nv, i, c2, kd]
+                                )
+                            # Apply decay mask and causal mask (c2 > c1 → 0)
+                            recurrent_state_update_attn_out_buf[b, nv, i, c1, c2] = T.if_then_else(
+                                c2 > c1,  # Strictly upper triangular (diagonal=1)
+                                T.float32(0.0),
+                                recurrent_state_update_attn_out_buf[b, nv, i, c1, c2] * decay_mask_buf[b, nv, i, c1, c2]
+                            )
+                    
                     for c in T.thread_binding(_chunk_size, thread="threadIdx.x"):
-                    # v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
-                    # Shape: k_cumdecay[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
-                    #        -> v_prime[b, nv, i, chunk_size, value_dim]
+                        # v_prime = k_cumdecay_buf[:, :, i] @ last_recurrent_state
+                        # Shape: k_cumdecay_buf[b, nv, i, chunk_size, key_dim] @ last_recurrent_state[b, nv, key_dim, value_dim]
+                        #        -> v_prime[b, nv, i, chunk_size, value_dim]
                         for vd in T.serial(_linear_value_head_dim):
                             # Initialize v_prime for this (c, vd) position
-                            recurrent_state_update_v_buf[b, nv, i, c, vd] = T.float32(0.0)
+                            recurrent_state_update_v_buf_buf[b, nv, i, c, vd] = T.float32(0.0)
                             # Reduction over key_dim
                             for kd in T.serial(_linear_key_head_dim):
-                                recurrent_state_update_v_buf[b, nv, i, c, vd] += (
-                                    k_cumdecay[b, nv, i, c, kd]
+                                recurrent_state_update_v_buf_buf[b, nv, i, c, vd] += (
+                                    k_cumdecay_buf[b, nv, i, c, kd]
                                     * recurrent_state_out_buf[b, nv, kd, vd]
                                 )
                             # calculate the v_new in place: v_new = v_i - v_prime
                             # where v_i is v[:,:,i]
-                            for kd in T.serial(_linear_key_head_dim):
-                                recurrent_state_update_v_buf[b, nv, i, c, vd] = (
-                                    value_attn_vbeta_matmul_out[b, nv, i, c, vd]
-                                    - recurrent_state_update_v_buf[b, nv, i, c, vd]
-                                )
+                            # BUG FIX: Remove redundant loop - this operation doesn't use kd
+                            recurrent_state_update_v_buf_buf[b, nv, i, c, vd] = (
+                                value_attn_vbeta_matmul_out_buf[b, nv, i, c, vd]
+                                - recurrent_state_update_v_buf_buf[b, nv, i, c, vd]
+                            )
                         for vd in T.serial(_linear_value_head_dim):
                             # (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
                             # initialize this position
-                            recurrent_state_update_attn_inter[b, nv, i, c, vd] = T.float32(0.0)
+                            recurrent_state_update_attn_inter_buf[b, nv, i, c, vd] = T.float32(0.0)
                             # reduction over key dim with inlined elemw matrix
                             for kd in T.serial(_linear_key_head_dim):
-                                elemw = query_chunked[b, nv, i, c, kd] * T.exp(
-                                    g_cumsum[b, nv, i, c]
+                                elemw = query_chunked_buf[b, nv, i, c, kd] * T.exp(
+                                    g_cumsum_buf[b, nv, i, c]
                                 )
-                                recurrent_state_update_attn_inter[b, nv, i, c, vd] += (
+                                recurrent_state_update_attn_inter_buf[b, nv, i, c, vd] += (
                                     elemw * recurrent_state_out_buf[b, nv, kd, vd]
                                 )
                         
                         for vd in T.serial(_linear_value_head_dim):
                             # compute core_attn_out to intermediate buffer
                             # initialize to the attn_inter value
-                            core_attn_out_inter[b, nv, i, c, vd] = recurrent_state_update_attn_inter[b, nv, i, c, vd]
+                            core_attn_out_inter_buf[b, nv, i, c, vd] = recurrent_state_update_attn_inter_buf[b, nv, i, c, vd]
 
                             for r in T.serial(_chunk_size):
-                                attn_val = attn_identity_add_out[b, nv, i, c, r]
-                                v_new_val = recurrent_state_update_v_buf[b, nv, i, r, vd]
-                                core_attn_out_inter[b, nv, i, c, vd] += attn_val * v_new_val
-
+                                # Use the intra-chunk attention computed fresh for this chunk
+                                attn_val = recurrent_state_update_attn_out_buf[b, nv, i, c, r]
+                                v_new_val = recurrent_state_update_v_buf_buf[b, nv, i, r, vd]
+                                core_attn_out_inter_buf[b, nv, i, c, vd] += attn_val * v_new_val
+                    
+                    # CRITICAL FIX: Recurrent state update must happen OUTSIDE thread binding to avoid race condition
                     # Update recurrent state after processing chunk i
                     # PyTorch: last_recurrent_state = last_recurrent_state * g[:, :, i, -1, None, None].exp()
                     #          + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-                    # This happens once per (batch, head, chunk) after all threadIdx.x threads finish
-                    # We're still inside the thread bindings (blockIdx.x, blockIdx.y),
-                    # so we use serial loops here (can't add more thread bindings)
                     for kd in T.serial(_linear_key_head_dim):
                         for vd in T.serial(_linear_value_head_dim):
                             # Part 1: Decay old state by exp(g[i, -1])
-                            # g_cumsum[b, nv, i, chunk_size-1] is the cumulative sum at the last position
-                            g_last = g_cumsum[b, nv, i, _chunk_size - 1]
+                            # g_cumsum_buf[b, nv, i, chunk_size-1] is the cumulative sum at the last position
+                            g_last = g_cumsum_buf[b, nv, i, _chunk_size - 1]
                             recurrent_state_out_buf[b, nv, kd, vd] = (
                                 recurrent_state_out_buf[b, nv, kd, vd] * T.exp(g_last)
                             )
@@ -932,12 +972,12 @@ def _chunk_gated_delta_rule(
                             # This is an outer product reduction: sum over chunk positions
                             for c_pos in T.serial(_chunk_size):
                                 # Compute decay factor for this position
-                                g_curr = g_cumsum[b, nv, i, c_pos]
+                                g_curr = g_cumsum_buf[b, nv, i, c_pos]
                                 decay_factor = T.exp(g_last - g_curr)
                                 
                                 # k[c_pos, kd] * (v_new[c_pos, vd] * decay_factor)
-                                k_val = key_chunked[b, nv, i, c_pos, kd]
-                                v_new_val = recurrent_state_update_v_buf[b, nv, i, c_pos, vd]
+                                k_val = key_chunked_buf[b, nv, i, c_pos, kd]
+                                v_new_val = recurrent_state_update_v_buf_buf[b, nv, i, c_pos, vd]
                                 
                                 recurrent_state_out_buf[b, nv, kd, vd] += (
                                     k_val * v_new_val * decay_factor
@@ -954,7 +994,7 @@ def _chunk_gated_delta_rule(
                 chunk_idx = vs // _chunk_size
                 chunk_pos = vs % _chunk_size
                 # Read from intermediate buffer and write to final output with transpose
-                core_attn_out_buf[vb, vs, vnv, vvd] = core_attn_out_inter[vb, vnv, chunk_idx, chunk_pos, vvd]
+                core_attn_out_buf[vb, vs, vnv, vvd] = core_attn_out_inter_buf[vb, vnv, chunk_idx, chunk_pos, vvd]
 
     if use_qk_l2norm_in_kernel:
         return None
@@ -1149,7 +1189,7 @@ def build_chunk_gated_delta_rule(
     schedule_6d_batched_matmul(sch, "attn_mm", ["c1", "c2"], "kd")
     schedule_6d_batched_matmul(sch, "value_attn_vbeta_matmul", ["c", "vd"], "r")
     schedule_6d_batched_matmul(sch, "k_cumdecay_mm", ["c", "kd"], "r")
-    schedule_6d_batched_matmul(sch, "recurrent_state_mm_1", ["c1", "c2"], "r")
+    # recurrent_state_mm_1 block removed - attention is computed fresh inside inter-chunk loop
     
     # Mark as scheduled and build
     mod["chunk_gated_delta"] = sch.mod["main"].with_attr("tir.is_scheduled", True)
@@ -1157,6 +1197,77 @@ def build_chunk_gated_delta_rule(
     target_obj = tvm.target.Target(target)
     built = tvm.build(mod, target=target_obj)
     return built
+
+
+def get_intermediate_buffer_shapes(
+    batch_size: int,
+    seq_len: int,
+    linear_num_value_heads: int,
+    linear_value_head_dim: int,
+    linear_key_head_dim: int,
+    chunk_size: int = 64,
+):
+    """
+    Helper function to compute shapes for all intermediate buffers.
+    
+    Args:
+        batch_size: Batch size
+        seq_len: Sequence length
+        linear_num_value_heads: Number of value heads
+        linear_value_head_dim: Value head dimension
+        linear_key_head_dim: Key head dimension
+        chunk_size: Chunk size (default: 64)
+    
+    Returns:
+        Dictionary mapping buffer names to their shapes (as tuples)
+    """
+    import math
+    
+    # Compute padded length and number of chunks
+    num_chunks = math.ceil(seq_len / chunk_size)
+    padded_len = num_chunks * chunk_size
+    
+    shapes = {
+        # Transposed/padded buffers
+        "query_T": (batch_size, linear_num_value_heads, padded_len, linear_key_head_dim),
+        "key_T": (batch_size, linear_num_value_heads, padded_len, linear_key_head_dim),
+        "k_beta": (batch_size, linear_num_value_heads, padded_len, linear_key_head_dim),
+        "value_T": (batch_size, linear_num_value_heads, padded_len, linear_value_head_dim),
+        "v_beta": (batch_size, linear_num_value_heads, padded_len, linear_value_head_dim),
+        "g_T": (batch_size, linear_num_value_heads, padded_len),
+        "beta_T": (batch_size, linear_num_value_heads, padded_len),
+        
+        # Chunked buffers
+        "query_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_key_head_dim),
+        "key_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_key_head_dim),
+        "value_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+        "k_beta_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_key_head_dim),
+        "v_beta_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+        "g_chunked": (batch_size, linear_num_value_heads, num_chunks, chunk_size),
+        "g_cumsum": (batch_size, linear_num_value_heads, num_chunks, chunk_size),
+        
+        # Attention buffers
+        "decay_mask": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        "attn_mm_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        "attn_decay_neg_mask_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        "attn_associative_scan_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        "attn_identity_add_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        
+        # Matmul/computation buffers
+        "value_attn_vbeta_matmul_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+        "k_beta_x_g_cumsum_exp_tmp": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_key_head_dim),
+        "k_cumdecay": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_key_head_dim),
+        
+        # Recurrent state update buffers
+        "recurrent_state_update_attn_out": (batch_size, linear_num_value_heads, num_chunks, chunk_size, chunk_size),
+        "recurrent_state_update_v_buf": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+        "recurrent_state_update_attn_inter": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+        
+        # Output buffer
+        "core_attn_out_inter": (batch_size, linear_num_value_heads, num_chunks, chunk_size, linear_value_head_dim),
+    }
+    
+    return shapes
 
 
 # ============================================================================

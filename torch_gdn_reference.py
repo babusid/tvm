@@ -60,7 +60,8 @@ def torch_chunk_gated_delta_rule(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    capture_intermediates: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
     """
     Chunked Gated DeltaNet Forward Pass.
     
@@ -74,13 +75,16 @@ def torch_chunk_gated_delta_rule(
         initial_state: Optional initial recurrent state
         output_final_state: Whether to return the final recurrent state
         use_qk_l2norm_in_kernel: Whether to L2-normalize query/key
+        capture_intermediates: Whether to capture intermediate tensors for debugging
     
     Returns:
-        Tuple of (output, final_state)
+        Tuple of (output, final_state, intermediates)
         - output: Shape (batch_size, seq_len, linear_num_value_heads, linear_value_head_dim)
         - final_state: Shape (batch_size, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim) or None
+        - intermediates: Dict of intermediate tensors (only if capture_intermediates=True)
     """
     initial_dtype = query.dtype
+    intermediates = {} if capture_intermediates else None
     
     # Optional L2 normalization
     if use_qk_l2norm_in_kernel:
@@ -109,9 +113,20 @@ def torch_chunk_gated_delta_rule(
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
     
+    if capture_intermediates:
+        intermediates['query_T'] = query.clone()  # Corresponds to TVM query_T (after transpose, pad, scale)
+        intermediates['key_T'] = key.clone()      # Corresponds to TVM key_T (after transpose, pad)
+        intermediates['value_T'] = value.clone()
+        intermediates['g_T'] = g.clone()
+        intermediates['beta_T'] = beta.clone()
+    
     # Compute v_beta and k_beta
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
+    
+    if capture_intermediates:
+        intermediates['v_beta'] = v_beta.clone()
+        intermediates['k_beta'] = k_beta.clone()
     
     # Reshape to chunks
     query, key, value, k_beta, v_beta = [
@@ -120,13 +135,35 @@ def torch_chunk_gated_delta_rule(
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
     
+    if capture_intermediates:
+        intermediates['query_chunked'] = query.clone()
+        intermediates['key_chunked'] = key.clone()
+        intermediates['value_chunked'] = value.clone()
+        intermediates['k_beta_chunked'] = k_beta.clone()
+        intermediates['v_beta_chunked'] = v_beta.clone()
+        intermediates['g_chunked'] = g.clone()
+    
     # Causal mask
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
     
     # Chunk decay and attention
     g = g.cumsum(dim=-1)
+    if capture_intermediates:
+        intermediates['g_cumsum'] = g.clone()
+    
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    if capture_intermediates:
+        intermediates['decay_mask'] = decay_mask.clone()
+    
+    # Capture raw matmul before negation/masking (matches TVM's attn_mm_out)
+    attn_raw = k_beta @ key.transpose(-1, -2)
+    if capture_intermediates:
+        intermediates['attn_mm_out'] = attn_raw.clone()
+    
+    # Apply negation and decay mask, then causal mask (matches TVM's attn_decay_neg_mask_out)
+    attn = -(attn_raw * decay_mask).masked_fill(mask, 0)
+    if capture_intermediates:
+        intermediates['attn_decay_neg_mask_out'] = attn.clone()
     
     # Associative scan
     for i in range(1, chunk_size):
@@ -134,9 +171,24 @@ def torch_chunk_gated_delta_rule(
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     
+    if capture_intermediates:
+        intermediates['attn_associative_scan_out'] = attn.clone()
+    
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    if capture_intermediates:
+        intermediates['attn_identity_add_out'] = attn.clone()
+    
     value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    if capture_intermediates:
+        intermediates['value_attn_vbeta_matmul_out'] = value.clone()
+    
+    k_beta_x_g_exp = k_beta * g.exp().unsqueeze(-1)
+    if capture_intermediates:
+        intermediates['k_beta_x_g_cumsum_exp_tmp'] = k_beta_x_g_exp.clone()
+    
+    k_cumdecay = attn @ k_beta_x_g_exp
+    if capture_intermediates:
+        intermediates['k_cumdecay'] = k_cumdecay.clone()
     
     # Initialize recurrent state
     last_recurrent_state = (
@@ -151,14 +203,27 @@ def torch_chunk_gated_delta_rule(
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        if capture_intermediates and i == 0:
+            intermediates['recurrent_state_update_attn_out'] = attn.clone()
+        
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
+        if capture_intermediates and i == 0:
+            intermediates['recurrent_state_update_v_buf'] = v_new.clone()
+        
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        if capture_intermediates and i == 0:
+            intermediates['recurrent_state_update_attn_inter'] = attn_inter.clone()
+        
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
+    
+    # Capture final inter-chunk output before reshaping/padding removal
+    if capture_intermediates:
+        intermediates['core_attn_out_inter'] = core_attn_out.clone()
     
     if not output_final_state:
         last_recurrent_state = None
@@ -172,4 +237,4 @@ def torch_chunk_gated_delta_rule(
     # Transpose back to (batch, seq, heads, dim)
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     
-    return core_attn_out, last_recurrent_state
+    return core_attn_out, last_recurrent_state, intermediates

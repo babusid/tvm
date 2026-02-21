@@ -204,7 +204,7 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
     
     # PyTorch reference
     print("\nRunning PyTorch reference...")
-    torch_out, torch_state = torch_chunk_gated_delta_rule(
+    torch_out, torch_state, torch_intermediates = torch_chunk_gated_delta_rule(
         query.clone(),
         key.clone(),
         value.clone(),
@@ -214,6 +214,7 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=False,
+        capture_intermediates=True,
     )
     
     # Build TVM kernel
@@ -232,9 +233,27 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
     print("Running TVM kernel...")
     ctx = tvm.cuda(0)
     
+    # Import helper to get buffer shapes
+    from gdn_kernel_dev import get_intermediate_buffer_shapes
+    
+    # Get all intermediate buffer shapes
+    buffer_shapes = get_intermediate_buffer_shapes(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        linear_num_value_heads=num_v_heads,
+        linear_value_head_dim=v_head_dim,
+        linear_key_head_dim=k_head_dim,
+        chunk_size=chunk_size,
+    )
+    
     # Create output buffers
     tvm_core_attn_out = tvm.runtime.empty((batch_size, seq_len, num_v_heads, v_head_dim), dtype="float32", device=ctx)
     tvm_state_out = tvm.runtime.empty((batch_size, num_v_heads, k_head_dim, v_head_dim), dtype="float32", device=ctx)
+    
+    # Allocate all intermediate buffers
+    intermediate_buffers = {}
+    for name, shape in buffer_shapes.items():
+        intermediate_buffers[name] = tvm.runtime.empty(shape, dtype="float32", device=ctx)
     
     # Convert PyTorch tensors to TVM
     tvm_query = tvm.runtime.from_dlpack(query)
@@ -247,7 +266,7 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
     initial_state = torch.zeros(batch_size, num_v_heads, k_head_dim, v_head_dim, dtype=dtype, device=device)
     tvm_initial_state = tvm.runtime.from_dlpack(initial_state)
     
-    # Run kernel
+    # Run kernel (with all intermediate buffers)
     tvm_kernel(
         tvm_query,
         tvm_key,
@@ -257,14 +276,151 @@ def test_chunk_gated_delta_rule(batch_size=2, seq_len=128, num_v_heads=32, v_hea
         tvm_initial_state,
         tvm_core_attn_out,
         tvm_state_out,
+        # Intermediate buffers in order
+        intermediate_buffers["query_T"],
+        intermediate_buffers["key_T"],
+        intermediate_buffers["k_beta"],
+        intermediate_buffers["value_T"],
+        intermediate_buffers["v_beta"],
+        intermediate_buffers["g_T"],
+        intermediate_buffers["beta_T"],
+        intermediate_buffers["query_chunked"],
+        intermediate_buffers["key_chunked"],
+        intermediate_buffers["value_chunked"],
+        intermediate_buffers["k_beta_chunked"],
+        intermediate_buffers["v_beta_chunked"],
+        intermediate_buffers["g_chunked"],
+        intermediate_buffers["g_cumsum"],
+        intermediate_buffers["decay_mask"],
+        intermediate_buffers["attn_mm_out"],
+        intermediate_buffers["attn_decay_neg_mask_out"],
+        intermediate_buffers["attn_associative_scan_out"],
+        intermediate_buffers["attn_identity_add_out"],
+        intermediate_buffers["value_attn_vbeta_matmul_out"],
+        intermediate_buffers["k_beta_x_g_cumsum_exp_tmp"],
+        intermediate_buffers["k_cumdecay"],
+        intermediate_buffers["recurrent_state_update_attn_out"],
+        intermediate_buffers["recurrent_state_update_v_buf"],
+        intermediate_buffers["recurrent_state_update_attn_inter"],
+        intermediate_buffers["core_attn_out_inter"],
     )
     
     # Convert back to numpy for comparison
     tvm_out_np = tvm_core_attn_out.numpy()
-
-    print(torch_out)
-    print(tvm_out_np)
     torch_out_np = torch_out.cpu().numpy()
+    
+    # DEBUG: Check intermediate buffers that feed into kernel_22
+    print(f"\n{'='*70}")
+    print("DEBUG: Kernel 22 Input Buffers")
+    print(f"{'='*70}")
+    
+    debug_buffers = [
+        "attn_identity_add_out",
+        "k_cumdecay",
+        "key_chunked", 
+        "query_chunked",
+        "g_cumsum",
+        "value_attn_vbeta_matmul_out",
+        "recurrent_state_update_v_buf",
+        "recurrent_state_update_attn_inter",
+        "core_attn_out_inter"
+    ]
+    
+    for buf_name in debug_buffers:
+        if buf_name in intermediate_buffers:
+            buf_np = intermediate_buffers[buf_name].numpy()
+            non_zero = np.count_nonzero(buf_np)
+            print(f"{buf_name:40s} shape={str(buf_np.shape):30s} "
+                  f"min={buf_np.min():10.6f} max={buf_np.max():10.6f} non_zero={non_zero}")
+    
+    # Check recurrent state output
+    state_out_np = tvm_state_out.numpy()
+    print(f"\nrecurrent_state_out (final) stats:")
+    print(f"  Shape: {state_out_np.shape}")
+    print(f"  Min: {state_out_np.min():.6f}, Max: {state_out_np.max():.6f}")
+    print(f"  Mean: {state_out_np.mean():.6f}, NaN count: {np.isnan(state_out_np).sum()}")
+    print(f"  Non-zero count: {np.count_nonzero(state_out_np)}")
+    
+    # Check core_attn_out_inter (before unchunking/padding removal)
+    core_inter_np = intermediate_buffers["core_attn_out_inter"].numpy()
+    print(f"\ncore_attn_out_inter stats:")
+    print(f"  Shape: {core_inter_np.shape}")
+    print(f"  Min: {core_inter_np.min():.6f}, Max: {core_inter_np.max():.6f}")
+    print(f"  Mean: {core_inter_np.mean():.6f}, NaN count: {np.isnan(core_inter_np).sum()}")
+    print(f"  Non-zero count: {np.count_nonzero(core_inter_np)}")
+    
+    # Check per-chunk statistics
+    print(f"\n Per-chunk analysis:")
+    for chunk_idx in range(core_inter_np.shape[2]):  # Iterate over chunks
+        chunk_data = core_inter_np[:, :, chunk_idx, :, :]
+        print(f"  Chunk {chunk_idx}: min={chunk_data.min():.3f}, max={chunk_data.max():.3f}, non_zero={np.count_nonzero(chunk_data)}/{chunk_data.size}")
+    
+    print(f"\nFinal tvm_core_attn_out stats:")
+    print(f"  Shape: {tvm_out_np.shape}")
+    print(f"  Min: {tvm_out_np.min():.6f}, Max: {tvm_out_np.max():.6f}")
+    print(f"  Mean: {tvm_out_np.mean():.6f}, NaN count: {np.isnan(tvm_out_np).sum()}")
+    print(f"  Non-zero count: {np.count_nonzero(tvm_out_np)}")
+    
+    # Print ALL intermediate buffer statistics and compare with PyTorch
+    print("\n" + "="*70)
+    print("Intermediate Buffer Comparison: TVM vs PyTorch")
+    print("="*70)
+    print(f"{'Buffer Name':35s} {'TVM Shape':25s} {'Torch Shape':25s} {'Max Diff':15s} {'Status':10s}")
+    print("-" * 130)
+    
+    for name in sorted(intermediate_buffers.keys()):
+        tvm_buf = intermediate_buffers[name].numpy()
+        
+        # Check if PyTorch has equivalent intermediate
+        if name in torch_intermediates:
+            torch_buf = torch_intermediates[name].cpu().numpy()
+            
+            # Handle inter-chunk buffers - PyTorch only captures chunk 0
+            # TVM shape: (batch, heads, num_chunks, chunk_size, dim)
+            # PyTorch shape: (batch, heads, chunk_size, dim)
+            if tvm_buf.shape != torch_buf.shape and len(tvm_buf.shape) == len(torch_buf.shape) + 1:
+                # Check if this is an inter-chunk buffer (has chunk dimension)
+                if name in ["recurrent_state_update_attn_out", "recurrent_state_update_v_buf", 
+                           "recurrent_state_update_attn_inter", "core_attn_out_inter"]:
+                    # Compare only chunk 0
+                    tvm_buf_chunk0 = tvm_buf[:, :, 0]  # Take first chunk
+                    if tvm_buf_chunk0.shape == torch_buf.shape:
+                        diff = np.abs(tvm_buf_chunk0 - torch_buf)
+                        max_diff = f"{np.max(diff):.6e}"
+                        if np.allclose(tvm_buf_chunk0, torch_buf, rtol=1e-4, atol=1e-4):
+                            status = "✓ MATCH (chunk 0)"
+                        else:
+                            status = "✗ DIFF (chunk 0)"
+                        print(f"{name:35s} {str(tvm_buf.shape):25s} {str(torch_buf.shape):25s} {max_diff:15s} {status:10s}")
+                        continue
+            
+            # Compare shapes
+            if tvm_buf.shape != torch_buf.shape:
+                status = "SHAPE MISMATCH"
+                max_diff = "N/A"
+            else:
+                diff = np.abs(tvm_buf - torch_buf)
+                max_diff = f"{np.max(diff):.6e}"
+                
+                # Check if values match
+                if np.allclose(tvm_buf, torch_buf, rtol=1e-4, atol=1e-4):
+                    status = "✓ MATCH"
+                else:
+                    status = "✗ DIFF"
+                    
+            print(f"{name:35s} {str(tvm_buf.shape):25s} {str(torch_buf.shape):25s} {max_diff:15s} {status:10s}")
+        else:
+            # No PyTorch equivalent
+            has_nan = np.isnan(tvm_buf).sum() > 0
+            has_inf = np.isinf(tvm_buf).sum() > 0
+            flag = ""
+            if has_nan:
+                flag += "[NaN]"
+            if has_inf:
+                flag += "[Inf]"
+            print(f"{name:35s} {str(tvm_buf.shape):25s} {'N/A':25s} {'N/A':15s} {flag:10s}")
+    
+    print("="*70 + "\n")
     
     # Check results
     print("\nComparing results...")
