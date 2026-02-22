@@ -334,6 +334,11 @@ if __name__ == "__main__":
         type=int,
         help="Sequence length for custom test (requires --batch_size and --func)",
     )
+    parser.add_argument(
+        "--num_iters",
+        type=int,
+        help="Override the number of iterations for tests (default: use dict values)",
+    )
 
     args = parser.parse_args()
 
@@ -535,11 +540,13 @@ if __name__ == "__main__":
     # Determine which tests to run
     if args.batch_size is not None and args.seq_len is not None:
         # Custom test with specified batch_size and seq_len
+        # Use provided num_iters or default to 5
+        num_iterations = args.num_iters if args.num_iters is not None else 5
         if args.func == "causal_conv1d_update":
             test_configs_to_run = {
                 f"causal_conv1d_update_custom_b{args.batch_size}_s{args.seq_len}": (
                     test_causal_conv1d_update,
-                    5,
+                    num_iterations,
                     {
                         "batch_size": args.batch_size,
                         "hidden_size": 128,
@@ -554,7 +561,7 @@ if __name__ == "__main__":
             test_configs_to_run = {
                 f"chunk_gated_delta_rule_custom_b{args.batch_size}_s{args.seq_len}": (
                     test_chunk_gated_delta_rule,
-                    5,
+                    num_iterations,
                     {
                         "batch_size": args.batch_size,
                         "seq_len": args.seq_len,
@@ -570,9 +577,13 @@ if __name__ == "__main__":
             }
     else:
         # Use default TEST_CONFIGS, filtered by --func if specified
+        # Override num_iterations if --num_iters provided
         test_configs_to_run = {}
         for test_name, (test_func, num_iterations, test_kwargs) in TEST_CONFIGS.items():
             if args.func is None or args.func in test_name:
+                # Override num_iterations if flag provided
+                if args.num_iters is not None:
+                    num_iterations = args.num_iters
                 test_configs_to_run[test_name] = (test_func, num_iterations, test_kwargs)
 
     # Run test configurations
