@@ -963,7 +963,7 @@ def _chunk_gated_delta_rule(
                                 value_attn_vbeta_matmul_out[b, nv, i, c, vd]
                                 - recurrent_state_update_v_buf[b, nv, i, c, vd]
                             )
-                        # still within the _chunk_size threadbinding because we still need that dim 
+                        # still within the _chunk_size threadbinding because we still need that dim
                         # here
                         for vd in T.serial(_linear_value_head_dim):
                             # (q_i * exp(g[:, :, i, :])) @ recurrent_state
@@ -1082,7 +1082,7 @@ def build_causal_conv1d_update(
         mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
 
     built = tir.build(mod, target=target_obj)
-    return built
+    return built, mod
 
 
 def build_chunk_gated_delta_rule(
@@ -1240,7 +1240,7 @@ def build_chunk_gated_delta_rule(
     # Disable storage rewrite to prevent buffer aliasing across loop iterations
     with tvm.transform.PassContext(config={"tir.disable_storage_rewrite": True}):
         built = tir.build(mod, target=target_obj)
-    return built
+    return built, mod
 
 
 # ============================================================================
@@ -1254,13 +1254,16 @@ if __name__ == "__main__":
     # Build causal conv1d
     print("Building causal_conv1d_update...")
     try:
-        conv1d_kernel = build_causal_conv1d_update(
+        conv1d_kernel, mod = build_causal_conv1d_update(
             hidden_size=128,
             state_len=3,
             has_bias=True,
             activation="silu",
         )
         print("✓ causal_conv1d_update built successfully\n")
+        print("=== Generated TIR Source ===")
+        mod.show()
+
         print("=== Generated CUDA source ===")
         cuda_src = conv1d_kernel.imports[0].inspect_source()
         print(cuda_src)
@@ -1272,7 +1275,7 @@ if __name__ == "__main__":
     # Build chunk gated delta rule
     print("Building chunk_gated_delta_rule...")
     try:
-        chunk_kernel = build_chunk_gated_delta_rule(
+        chunk_kernel, mod = build_chunk_gated_delta_rule(
             linear_num_value_heads=32,
             linear_value_head_dim=128,
             linear_num_key_heads=16,
@@ -1280,6 +1283,8 @@ if __name__ == "__main__":
             chunk_size=64,
         )
         print("✓ chunk_gated_delta_rule built successfully\n")
+        print("=== Generated TIR Source ===")
+        mod.show()
 
         # Print generated CUDA source for inspection
         print("=== Generated CUDA source ===")

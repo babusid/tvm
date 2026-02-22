@@ -115,7 +115,7 @@ def test_causal_conv1d_update(
 
     # Build TVM kernel
     print("\nBuilding TVM kernel...")
-    tvm_kernel = build_causal_conv1d_update(
+    tvm_kernel, _ = build_causal_conv1d_update(
         hidden_size=hidden_size,
         state_len=state_len,
         has_bias=True,
@@ -242,7 +242,7 @@ def test_chunk_gated_delta_rule(
 
     # Build TVM kernel (force fresh build by adding unique name suffix)
     print("\nBuilding TVM kernel...")
-    tvm_kernel = build_chunk_gated_delta_rule(
+    tvm_kernel,_ = build_chunk_gated_delta_rule(
         linear_num_value_heads=num_v_heads,
         linear_value_head_dim=v_head_dim,
         linear_num_key_heads=num_k_heads,
@@ -324,28 +324,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--func",
         choices=["causal_conv1d_update", "chunk_gated_delta_rule"],
-        help="Filter tests by function name"
+        help="Filter tests by function name",
     )
     parser.add_argument(
-        "--batch_size",
-        type=int,
-        help="Batch size for custom test (requires --seq_len and --func)"
+        "--batch_size", type=int, help="Batch size for custom test (requires --seq_len and --func)"
     )
     parser.add_argument(
         "--seq_len",
         type=int,
-        help="Sequence length for custom test (requires --batch_size and --func)"
+        help="Sequence length for custom test (requires --batch_size and --func)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Validate arguments
     has_batch = args.batch_size is not None
     has_seq = args.seq_len is not None
-    
+
     if has_batch != has_seq:
         parser.error("--batch_size and --seq_len must be specified together")
-    
+
     if (has_batch or has_seq) and args.func is None:
         parser.error("--func must be specified when using --batch_size and --seq_len")
 
