@@ -548,6 +548,100 @@ def _chunk_gated_delta_rule(
                     vb, vnv, vkd, vvd
                 ]
 
+        # Initialize ALL intermediate buffers to zero to prevent garbage accumulation
+        # when TVM reuses GPU memory across kernel invocations.
+        # Grouped by buffer shape to minimize kernel launch overhead.
+        
+        # Group 1: Shape (batch, heads, padded_len, key_dim) - query_T, key_T, k_beta
+        for b, nv, s, kd in T.grid(
+            batch_size, _linear_num_value_heads, padded_len, _linear_key_head_dim
+        ):
+            with T.sblock("init_buffers_key_dim_padded"):
+                vb, vnv, vs, vkd = T.axis.remap("SSSS", [b, nv, s, kd])
+                query_T[vb, vnv, vs, vkd] = T.float32(0.0)
+                key_T[vb, vnv, vs, vkd] = T.float32(0.0)
+                k_beta[vb, vnv, vs, vkd] = T.float32(0.0)
+        
+        # Group 2: Shape (batch, heads, padded_len, value_dim) - value_T, v_beta
+        for b, nv, s, vd in T.grid(
+            batch_size, _linear_num_value_heads, padded_len, _linear_value_head_dim
+        ):
+            with T.sblock("init_buffers_value_dim_padded"):
+                vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
+                value_T[vb, vnv, vs, vvd] = T.float32(0.0)
+                v_beta[vb, vnv, vs, vvd] = T.float32(0.0)
+        
+        # Group 3: Shape (batch, heads, padded_len) - g_T, beta_T
+        for b, nv, s in T.grid(
+            batch_size, _linear_num_value_heads, padded_len
+        ):
+            with T.sblock("init_buffers_scalar_padded"):
+                vb, vnv, vs = T.axis.remap("SSS", [b, nv, s])
+                g_T[vb, vnv, vs] = T.float32(0.0)
+                beta_T[vb, vnv, vs] = T.float32(0.0)
+        
+        # Group 4: Shape (batch, heads, num_chunks, chunk_size, key_dim) - query_chunked, key_chunked, k_beta_chunked
+        num_chunks = tir.ceildiv(seq_len, _chunk_size)
+        for b, nv, nc, c, kd in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_key_head_dim
+        ):
+            with T.sblock("init_buffers_key_dim_chunked"):
+                vb, vnv, vnc, vc, vkd = T.axis.remap("SSSSS", [b, nv, nc, c, kd])
+                query_chunked[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+                key_chunked[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+                k_beta_chunked[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+        
+        # Group 5: Shape (batch, heads, num_chunks, chunk_size, value_dim) - value_chunked, v_beta_chunked
+        for b, nv, nc, c, vd in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_value_head_dim
+        ):
+            with T.sblock("init_buffers_value_dim_chunked"):
+                vb, vnv, vnc, vc, vvd = T.axis.remap("SSSSS", [b, nv, nc, c, vd])
+                value_chunked[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                v_beta_chunked[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+        
+        # Group 6: Shape (batch, heads, num_chunks, chunk_size) - g_chunked, g_cumsum
+        for b, nv, nc, c in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size
+        ):
+            with T.sblock("init_buffers_scalar_chunked"):
+                vb, vnv, vnc, vc = T.axis.remap("SSSS", [b, nv, nc, c])
+                g_chunked[vb, vnv, vnc, vc] = T.float32(0.0)
+                #g_cumsum[vb, vnv, vnc, vc] = T.float32(0.0)
+        
+        # Group 7: Shape (batch, heads, num_chunks, chunk_size, chunk_size) - decay_mask and attention buffers
+        for b, nv, nc, c1, c2 in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size
+        ):
+            with T.sblock("init_buffers_attention"):
+                vb, vnv, vnc, vc1, vc2 = T.axis.remap("SSSSS", [b, nv, nc, c1, c2])
+                decay_mask[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                #attn_mm_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                attn_decay_neg_mask_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                attn_associative_scan_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                attn_identity_add_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+                recurrent_state_update_attn_out[vb, vnv, vnc, vc1, vc2] = T.float32(0.0)
+        
+        # Group 8: Shape (batch, heads, num_chunks, chunk_size, value_dim) - matmul outputs and intermediates
+        for b, nv, nc, c, vd in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_value_head_dim
+        ):
+            with T.sblock("init_buffers_value_matmul"):
+                vb, vnv, vnc, vc, vvd = T.axis.remap("SSSSS", [b, nv, nc, c, vd])
+                #value_attn_vbeta_matmul_out[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                recurrent_state_update_v_buf[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                recurrent_state_update_attn_inter[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+                core_attn_out_inter[vb, vnv, vnc, vc, vvd] = T.float32(0.0)
+        
+        # Group 9: Shape (batch, heads, num_chunks, chunk_size, key_dim) - k_beta_x_g_cumsum_exp_tmp, k_cumdecay
+        for b, nv, nc, c, kd in T.grid(
+            batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _linear_key_head_dim
+        ):
+            with T.sblock("init_buffers_key_matmul"):
+                vb, vnv, vnc, vc, vkd = T.axis.remap("SSSSS", [b, nv, nc, c, kd])
+                k_beta_x_g_cumsum_exp_tmp[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+                #k_cumdecay[vb, vnv, vnc, vc, vkd] = T.float32(0.0)
+
         # transpose, pad, scale query
         for b, s, nv, kd in T.grid(
             batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim
@@ -1095,6 +1189,16 @@ def build_chunk_gated_delta_rule(
 
     # Apply scheduling to all blocks
     spatial_blocks = [
+        # Zero-initialize ALL intermediate buffers to prevent garbage accumulation
+        "init_buffers_key_dim_padded",
+        "init_buffers_value_dim_padded", 
+        "init_buffers_scalar_padded",
+        "init_buffers_key_dim_chunked",
+        "init_buffers_value_dim_chunked",
+        "init_buffers_scalar_chunked",
+        "init_buffers_attention",
+        "init_buffers_value_matmul",
+        "init_buffers_key_matmul",
         "copy_last_recurrent_to_out",
         "transpose_qk_scale_q",
         "transpose_v",
