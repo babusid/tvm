@@ -6,6 +6,7 @@ Tests numerical correctness against PyTorch reference implementations.
 
 import sys
 import os
+import argparse
 
 # Add paths for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -315,15 +316,49 @@ def test_chunk_gated_delta_rule(
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Test suite for GatedDeltaNet TVM kernels",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--func",
+        choices=["causal_conv1d_update", "chunk_gated_delta_rule"],
+        help="Filter tests by function name"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        help="Batch size for custom test (requires --seq_len and --func)"
+    )
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        help="Sequence length for custom test (requires --batch_size and --func)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    has_batch = args.batch_size is not None
+    has_seq = args.seq_len is not None
+    
+    if has_batch != has_seq:
+        parser.error("--batch_size and --seq_len must be specified together")
+    
+    if (has_batch or has_seq) and args.func is None:
+        parser.error("--func must be specified when using --batch_size and --seq_len")
+
     print("\n" + "=" * 70)
     print("GatedDeltaNet TVM Kernel Test Suite")
     print("=" * 70)
 
     # Test configuration dictionary
-    # Key: test_name (string)
+    # Key: test_name (string) - format: {func}_b{batch}_s{seq_len}
     # Value: tuple of (test_func, num_iterations, kwargs_dict)
     TEST_CONFIGS = {
-        "causal_conv1d_update_baseline": (
+        # Causal Conv1D tests
+        "causal_conv1d_update_b2_s4": (
             test_causal_conv1d_update,
             5,
             {
@@ -335,8 +370,8 @@ if __name__ == "__main__":
                 "atol": 1e-4,
             },
         ),
-        # Baseline test - power of 2 batch/seq_len
-        "chunk_gated_delta_rule_baseline": (
+        # Chunked Gated Delta Rule tests - baseline (batch=2, seq_len=128)
+        "chunk_gated_delta_rule_b2_s128": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -352,7 +387,7 @@ if __name__ == "__main__":
             },
         ),
         # Non-power-of-2 batch size (3)
-        "chunk_gated_delta_rule_batch3": (
+        "chunk_gated_delta_rule_b3_s128": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -367,8 +402,8 @@ if __name__ == "__main__":
                 "atol": 5e-3,
             },
         ),
-        # Non-power-of-2 batch size (5) - upper realistic limit
-        "chunk_gated_delta_rule_batch5": (
+        # Non-power-of-2 batch size (5)
+        "chunk_gated_delta_rule_b5_s128": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -384,7 +419,7 @@ if __name__ == "__main__":
             },
         ),
         # Short sequence - single chunk (64 tokens)
-        "chunk_gated_delta_rule_seq64": (
+        "chunk_gated_delta_rule_b2_s64": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -400,7 +435,7 @@ if __name__ == "__main__":
             },
         ),
         # Non-power-of-2 sequence length (100 tokens, needs padding)
-        "chunk_gated_delta_rule_seq100": (
+        "chunk_gated_delta_rule_b2_s100": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -416,7 +451,7 @@ if __name__ == "__main__":
             },
         ),
         # Non-power-of-2 sequence length (200 tokens)
-        "chunk_gated_delta_rule_seq200": (
+        "chunk_gated_delta_rule_b2_s200": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -432,7 +467,7 @@ if __name__ == "__main__":
             },
         ),
         # Longer sequence - 512 tokens (8 chunks)
-        "chunk_gated_delta_rule_seq512": (
+        "chunk_gated_delta_rule_b2_s512": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -448,7 +483,7 @@ if __name__ == "__main__":
             },
         ),
         # Non-power-of-2 + longer (333 tokens, ~5.2 chunks)
-        "chunk_gated_delta_rule_seq333": (
+        "chunk_gated_delta_rule_b2_s333": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -464,7 +499,7 @@ if __name__ == "__main__":
             },
         ),
         # Combined: non-power-of-2 batch (3) + non-power-of-2 seq (150)
-        "chunk_gated_delta_rule_batch3_seq150": (
+        "chunk_gated_delta_rule_b3_s150": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -480,7 +515,7 @@ if __name__ == "__main__":
             },
         ),
         # Edge case: batch=1 (single sequence inference)
-        "chunk_gated_delta_rule_batch1_seq256": (
+        "chunk_gated_delta_rule_b1_s256": (
             test_chunk_gated_delta_rule,
             5,
             {
@@ -499,8 +534,51 @@ if __name__ == "__main__":
 
     results = {}
 
-    # Run all test configurations
-    for test_name, (test_func, num_iterations, test_kwargs) in TEST_CONFIGS.items():
+    # Determine which tests to run
+    if args.batch_size is not None and args.seq_len is not None:
+        # Custom test with specified batch_size and seq_len
+        if args.func == "causal_conv1d_update":
+            test_configs_to_run = {
+                f"causal_conv1d_update_custom_b{args.batch_size}_s{args.seq_len}": (
+                    test_causal_conv1d_update,
+                    5,
+                    {
+                        "batch_size": args.batch_size,
+                        "hidden_size": 128,
+                        "seq_len": min(args.seq_len, 16),  # Cap seq_len for conv1d
+                        "state_len": 3,
+                        "rtol": 1e-4,
+                        "atol": 1e-4,
+                    },
+                )
+            }
+        else:  # chunk_gated_delta_rule
+            test_configs_to_run = {
+                f"chunk_gated_delta_rule_custom_b{args.batch_size}_s{args.seq_len}": (
+                    test_chunk_gated_delta_rule,
+                    5,
+                    {
+                        "batch_size": args.batch_size,
+                        "seq_len": args.seq_len,
+                        "num_v_heads": 32,
+                        "v_head_dim": 128,
+                        "num_k_heads": 16,
+                        "k_head_dim": 128,
+                        "chunk_size": 64,
+                        "rtol": 5e-3,
+                        "atol": 5e-3,
+                    },
+                )
+            }
+    else:
+        # Use default TEST_CONFIGS, filtered by --func if specified
+        test_configs_to_run = {}
+        for test_name, (test_func, num_iterations, test_kwargs) in TEST_CONFIGS.items():
+            if args.func is None or args.func in test_name:
+                test_configs_to_run[test_name] = (test_func, num_iterations, test_kwargs)
+
+    # Run test configurations
+    for test_name, (test_func, num_iterations, test_kwargs) in test_configs_to_run.items():
         for iteration in range(num_iterations):
             test_instance_name = f"{test_name}_iter{iteration}"
             try:
