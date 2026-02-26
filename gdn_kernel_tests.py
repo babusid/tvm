@@ -1,34 +1,52 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 """
 Test suite for GatedDeltaNet TVM kernels.
 
 Tests numerical correctness against PyTorch reference implementations.
 """
 
-import sys
-import os
 import argparse
+import os
+import sys
 
 # Add paths for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hf_reference"))
 
-import torch
 import numpy as np
-import tvm
-# nd will be assigned from tvm.runtime.ndarray or similar based on TVM version
+import torch
 
+import tvm
+
+# nd will be assigned from tvm.runtime.ndarray or similar based on TVM version
 # Import TVM kernel builders
 from gdn_kernel_dev import (
-    build_causal_conv1d_update, 
+    build_causal_conv1d_update,
     build_chunk_gated_delta_rule,
-    build_recurrent_gated_delta_rule  # TODO: implement this in gdn_kernel_dev.py
+    build_recurrent_gated_delta_rule,  # TODO: implement this in gdn_kernel_dev.py
 )
 
 # Import PyTorch reference implementations
 from torch_gdn_reference import (
-    torch_causal_conv1d_update, 
+    torch_causal_conv1d_update,
     torch_chunk_gated_delta_rule,
-    torch_recurrent_gated_delta_rule
+    torch_recurrent_gated_delta_rule,
 )
 
 
@@ -97,10 +115,9 @@ def test_causal_conv1d_update(
         bool: True if test passes
     """
     print(f"\n{'=' * 70}")
-    print(f"Testing causal_conv1d_update")
-    print(
-        f"  batch_size={batch_size}, hidden_size={hidden_size}, seq_len={seq_len}, state_len={state_len}"
-    )
+    print("Testing causal_conv1d_update")
+    print(f"  batch_size={batch_size}, hidden_size={hidden_size}")
+    print(f"  seq_len={seq_len}, state_len={state_len}")
     print(f"  dtype={dtype}, rtol={rtol}, atol={atol}")
     print(f"{'=' * 70}")
 
@@ -212,7 +229,7 @@ def test_chunk_gated_delta_rule(
         bool: True if test passes
     """
     print(f"\n{'=' * 70}")
-    print(f"Testing chunk_gated_delta_rule")
+    print("Testing chunk_gated_delta_rule")
     print(f"  batch_size={batch_size}, seq_len={seq_len}")
     print(f"  num_v_heads={num_v_heads}, v_head_dim={v_head_dim}")
     print(f"  num_k_heads={num_k_heads}, k_head_dim={k_head_dim}")
@@ -250,7 +267,7 @@ def test_chunk_gated_delta_rule(
 
     # Build TVM kernel (force fresh build by adding unique name suffix)
     print("\nBuilding TVM kernel...")
-    tvm_kernel,_ = build_chunk_gated_delta_rule(
+    tvm_kernel, _ = build_chunk_gated_delta_rule(
         linear_num_value_heads=num_v_heads,
         linear_value_head_dim=v_head_dim,
         linear_num_key_heads=num_k_heads,
@@ -272,9 +289,8 @@ def test_chunk_gated_delta_rule(
         (batch_size, num_v_heads, k_head_dim, v_head_dim), dtype="float32", device=ctx
     )
 
-    print(
-        f"  TVM output buffer shapes: core_attn_out={tvm_core_attn_out.shape}, state_out={tvm_state_out.shape}"
-    )
+    print(f"  TVM output buffer shapes: core_attn_out={tvm_core_attn_out.shape}")
+    print(f"  state_out={tvm_state_out.shape}")
 
     # Convert PyTorch tensors to TVM
     tvm_query = tvm.runtime.from_dlpack(query.clone())
@@ -338,7 +354,7 @@ def test_recurrent_gated_delta_rule(
 ):
     """
     Test recurrent_gated_delta_rule kernel against PyTorch reference (decode path).
-    
+
     Args:
         batch_size: Batch size
         seq_len: Sequence length (can be any value, processed token-by-token)
@@ -351,12 +367,12 @@ def test_recurrent_gated_delta_rule(
         rtol: Relative tolerance
         atol: Absolute tolerance
         seed: Random seed
-    
+
     Returns:
         bool: True if test passes
     """
     print(f"\n{'=' * 70}")
-    print(f"Testing recurrent_gated_delta_rule (DECODE PATH)")
+    print("Testing recurrent_gated_delta_rule (DECODE PATH)")
     print(f"  batch_size={batch_size}, seq_len={seq_len}")
     print(f"  num_v_heads={num_v_heads}, v_head_dim={v_head_dim}")
     print(f"  num_k_heads={num_k_heads}, k_head_dim={k_head_dim}")
@@ -466,11 +482,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--func",
-        choices=["causal_conv1d_update", "chunk_gated_delta_rule", "recurrent_gated_delta_rule"],
+        choices=[
+            "causal_conv1d_update",
+            "chunk_gated_delta_rule",
+            "recurrent_gated_delta_rule",
+        ],
         help="Filter tests by function name",
     )
     parser.add_argument(
-        "--batch_size", type=int, help="Batch size for custom test (requires --seq_len and --func)"
+        "--batch_size",
+        type=int,
+        help="Batch size for custom test (requires --seq_len and --func)",
     )
     parser.add_argument(
         "--seq_len",
@@ -806,10 +828,18 @@ if __name__ == "__main__":
                 # Override num_iterations if flag provided
                 if args.num_iters is not None:
                     num_iterations = args.num_iters
-                test_configs_to_run[test_name] = (test_func, num_iterations, test_kwargs)
+                test_configs_to_run[test_name] = (
+                    test_func,
+                    num_iterations,
+                    test_kwargs,
+                )
 
     # Run test configurations
-    for test_name, (test_func, num_iterations, test_kwargs) in test_configs_to_run.items():
+    for test_name, (
+        test_func,
+        num_iterations,
+        test_kwargs,
+    ) in test_configs_to_run.items():
         for iteration in range(num_iterations):
             test_instance_name = f"{test_name}_iter{iteration}"
             try:

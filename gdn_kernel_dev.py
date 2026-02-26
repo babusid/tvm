@@ -1,7 +1,25 @@
-import tvm
-from tvm import DataType, te, tir, s_tir, topi
-from tvm.script import tir as T
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import math
+
+import tvm
+from tvm import s_tir, tir
+from tvm.script import tir as T
 
 
 def _gen_causal_conv1d_update(
@@ -47,28 +65,33 @@ def _gen_causal_conv1d_update(
             hidden_states, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype
         )
         conv_state_buf = T.match_buffer(
-            conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+            conv_state,
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len)),
+            dtype=_dtype,
         )
         next_conv_state_buf = T.match_buffer(
-            next_conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+            next_conv_state,
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len)),
+            dtype=_dtype,
         )
         out_buf = T.match_buffer(out, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
 
         # Allocate intermediate buffers
         hidden_states_new = T.alloc_buffer(
-            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len), dtype=_dtype
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len),
+            dtype=_dtype,
         )
         conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
 
         # Step 1: Concatenate conv_state and hidden_states along last dimension
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+        for b, h, sl in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
             with T.sblock("copy_conv_state_to_total_hidden_state"):
-                vb, vh, vl = T.axis.remap("SSS", [b, h, l])
+                vb, vh, vl = T.axis.remap("SSS", [b, h, sl])
                 hidden_states_new[vb, vh, vl] = conv_state_buf[vb, vh, vl]
 
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+        for b, h, sl in T.grid(batch_size, T.int64(_hidden_size), seq_len):
             with T.sblock("copy_new_hidden_state_to_total_hidden_state"):
-                vb, vh, vl = T.axis.remap("SSS", [b, h, l])
+                vb, vh, vl = T.axis.remap("SSS", [b, h, sl])
                 hidden_states_new[vb, vh, vl + T.int64(_state_len)] = hidden_states_buf[vb, vh, vl]
 
         # Step 2: Extract last state_len elements as next_conv_state
@@ -121,28 +144,33 @@ def _gen_causal_conv1d_update(
             hidden_states, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype
         )
         conv_state_buf = T.match_buffer(
-            conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+            conv_state,
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len)),
+            dtype=_dtype,
         )
         next_conv_state_buf = T.match_buffer(
-            next_conv_state, (batch_size, T.int64(_hidden_size), T.int64(_state_len)), dtype=_dtype
+            next_conv_state,
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len)),
+            dtype=_dtype,
         )
         out_buf = T.match_buffer(out, (batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
 
         # Allocate intermediate buffers
         hidden_states_new = T.alloc_buffer(
-            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len), dtype=_dtype
+            (batch_size, T.int64(_hidden_size), T.int64(_state_len) + seq_len),
+            dtype=_dtype,
         )
         conv_sum = T.alloc_buffer((batch_size, T.int64(_hidden_size), seq_len), dtype=_dtype)
 
         # Step 1: Concatenate conv_state and hidden_states along last dimension
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
+        for b, h, sl in T.grid(batch_size, T.int64(_hidden_size), T.int64(_state_len)):
             with T.sblock("copy_conv_state_to_total_hidden_state"):
-                vb, vh, vl = T.axis.remap("SSS", [b, h, l])
+                vb, vh, vl = T.axis.remap("SSS", [b, h, sl])
                 hidden_states_new[vb, vh, vl] = conv_state_buf[vb, vh, vl]
 
-        for b, h, l in T.grid(batch_size, T.int64(_hidden_size), seq_len):
+        for b, h, sl in T.grid(batch_size, T.int64(_hidden_size), seq_len):
             with T.sblock("copy_new_hidden_state_to_total_hidden_state"):
-                vb, vh, vl = T.axis.remap("SSS", [b, h, l])
+                vb, vh, vl = T.axis.remap("SSS", [b, h, sl])
                 hidden_states_new[vb, vh, vl + T.int64(_state_len)] = hidden_states_buf[vb, vh, vl]
 
         # Step 2: Extract last state_len elements as next_conv_state
@@ -195,7 +223,6 @@ def _chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     dtype: str = "float32",
 ):
-
     # Capture compile-time constants
     _linear_num_value_heads = linear_num_value_heads
     _linear_value_head_dim = linear_value_head_dim
@@ -230,7 +257,12 @@ def _chunk_gated_delta_rule(
         # output buffers
         recurrent_state_out_buf = T.match_buffer(
             recurrent_state_out,
-            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            (
+                batch_size,
+                _linear_num_value_heads,
+                _linear_key_head_dim,
+                _linear_value_head_dim,
+            ),
             dtype=_dtype,
         )
 
@@ -248,7 +280,9 @@ def _chunk_gated_delta_rule(
             dtype=_dtype,
         )
         key_buf = T.match_buffer(
-            key, (batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim), dtype=_dtype
+            key,
+            (batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim),
+            dtype=_dtype,
         )
         value_buf = T.match_buffer(
             value,
@@ -273,7 +307,8 @@ def _chunk_gated_delta_rule(
 
         # intermediate buffers have to be at root level, cant declare them later
         # pad_size = (_chunk_size - seq_len % _chunk_size) % _chunk_size
-        # Use ceildiv for tir.ceildiv(seq_len, _chunk_size) - avoids negative modulo issues in generated code
+        # Use ceildiv for tir.ceildiv(seq_len, _chunk_size) - avoids negative modulo issues in
+        # generated code
         # num_chunks = tir.ceildiv(seq_len, _chunk_size)
         # padded_len = num_chunks * _chunk_size
         # padding = padded_len - seq_len
@@ -545,7 +580,10 @@ def _chunk_gated_delta_rule(
         padding = padded_len - seq_len
 
         for b, nv, kd, vd in T.grid(
-            batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
+            batch_size,
+            _linear_num_value_heads,
+            _linear_key_head_dim,
+            _linear_value_head_dim,
         ):
             with T.sblock("copy_last_recurrent_to_out"):
                 vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b, nv, kd, vd])
@@ -657,7 +695,7 @@ def _chunk_gated_delta_rule(
             padded_len,
             _linear_value_head_dim,
         ):
-            with T.sblock(("chunk_reshape_v_vbeta")):
+            with T.sblock("chunk_reshape_v_vbeta"):
                 vb, vnv, vs, vvd = T.axis.remap("SSSS", [b, nv, s, vd])
                 value_chunked[vb, vnv, vs // _chunk_size, vs % _chunk_size, vvd] = value_T[
                     vb, vnv, vs, vvd
@@ -749,7 +787,8 @@ def _chunk_gated_delta_rule(
         # Associative scan: for each row i, update row i using rows 0..i-1
         # attn[i, j] = attn[i, j] + sum_{k=0}^{i-1} attn[i, k] * attn[k, j]
         # Strategy: Parallelize over (batch, heads, chunks), sequential scan within each thread
-        # Using explicit thread_binding here since s_tir.Schedule API doesn't support triangular bounds?
+        # Using explicit thread_binding here since s_tir.Schedule API doesn't support
+        # triangular bounds?
         for b, nv, nc, c1, c2 in T.grid(
             batch_size, _linear_num_value_heads, num_chunks, _chunk_size, _chunk_size
         ):
@@ -768,7 +807,8 @@ def _chunk_gated_delta_rule(
                             attn_associative_scan_out[b, nv, nc, i, j] = attn_decay_neg_mask_out[
                                 b, nv, nc, i, j
                             ]
-                            # selects each element in the row we're on, and the jth element of each each row below
+                            # selects each element in the row we're on, and the jth element of
+                            # each each row below
                             # current row. this mirrors the broadcast and elementwise multiply
                             # use inline += to mirror the column sum
                             # Associative scan: accumulate products from previous rows
@@ -852,7 +892,8 @@ def _chunk_gated_delta_rule(
                 # for i in range(0, total_sequence_length // chunk_size):
                 for i in T.serial(num_chunks):
                     # q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-                    # attn = (q_i @ k_i.transpose(-1,-2) * decay_mask_buf[:, :, i]).masked_fill_(mask, 0)
+                    # attn =
+                    # (q_i @ k_i.transpose(-1,-2) * decay_mask_buf[:, :, i]).masked_fill_(mask, 0)
                     for c1 in T.thread_binding(_chunk_size, thread="threadIdx.x"):
                         for c2 in T.serial(_chunk_size):
                             recurrent_state_update_attn_out[b, nv, i, c1, c2] = T.float32(0.0)
@@ -1009,7 +1050,12 @@ def _recurrent_gated_delta_rule(
         # Output buffers
         recurrent_state_out_buf = T.match_buffer(
             recurrent_state_out,
-            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            (
+                batch_size,
+                _linear_num_value_heads,
+                _linear_key_head_dim,
+                _linear_value_head_dim,
+            ),
             dtype=_dtype,
         )
         core_attn_out_buf = T.match_buffer(
@@ -1040,7 +1086,12 @@ def _recurrent_gated_delta_rule(
         )
         initial_state_buf = T.match_buffer(
             initial_state,
-            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            (
+                batch_size,
+                _linear_num_value_heads,
+                _linear_key_head_dim,
+                _linear_value_head_dim,
+            ),
             dtype=_dtype,
         )
 
@@ -1059,38 +1110,21 @@ def _recurrent_gated_delta_rule(
         )
         g_T = T.alloc_buffer((batch_size, _linear_num_value_heads, seq_len), dtype=_dtype)
         beta_T = T.alloc_buffer((batch_size, _linear_num_value_heads, seq_len), dtype=_dtype)
-        recurrent_state = T.alloc_buffer(
-            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
-            dtype=_dtype,
-        )
-        output_T = T.alloc_buffer(
-            (batch_size, _linear_num_value_heads, seq_len, _linear_value_head_dim),
-            dtype=_dtype,
-        )
         kv_mem = T.alloc_buffer(
-            (batch_size, _linear_num_value_heads, _linear_key_head_dim),
-            dtype=_dtype
+            (batch_size, _linear_num_value_heads, _linear_value_head_dim), dtype=_dtype
         )
 
-        # TODO: Implement recurrent gated delta rule computation
-        # The computation logic should follow the PyTorch reference:
-        # 1. Copy initial state to working buffer
-        # 2. Transpose inputs to (batch, heads, seq, dim) and scale query
-        # 3. For each position i in seq_len:
-        #    a. Compute kv_mem = (state * k_t).sum(dim=-1)
-        #    b. Update state: state = state * g_t + k_t * (v_t - kv_mem) * beta_t
-        #    c. Compute output: (state * q_t).sum(dim=-2)
-        # 4. Transpose output back to (batch, seq, heads, dim)
-        # 5. Copy final recurrent state to output
-
-        # For now, just copy initial state to output to prevent segfault
-        # and provide a minimal working structure
+        # Copy input state to output (initial state)
         for b, nv, kd, vd in T.grid(
-            batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
+            batch_size,
+            _linear_num_value_heads,
+            _linear_key_head_dim,
+            _linear_value_head_dim,
         ):
-            with T.sblock("init_recurrent_state"):
+            with T.sblock("copy_initial_state"):
                 vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b, nv, kd, vd])
-                recurrent_state[vb, vnv, vkd, vvd] = initial_state_buf[vb, vnv, vkd, vvd]
+                T.reads(initial_state_buf[vb, vnv, vkd, vvd])
+                T.writes(recurrent_state_out_buf[vb, vnv, vkd, vvd])
                 recurrent_state_out_buf[vb, vnv, vkd, vvd] = initial_state_buf[vb, vnv, vkd, vvd]
 
         # Zero-initialize output buffer
@@ -1133,20 +1167,21 @@ def _recurrent_gated_delta_rule(
                 g_T[vb, vnv, vs] = g_buf[vb, vs, vnv]
                 beta_T[vb, vnv, vs] = beta_buf[vb, vs, vnv]
 
-        # Stage 2 - Main recurrent loop with 5-level structure
+        # Main recurrent loop using recurrent_state_out_buf as working buffer
+        # (already initialized with initial_state values in copy_initial_state block above)
         # Parallel: batch, heads | Serial: seq_len, k_head_dim, v_head_dim
         for b in T.thread_binding(batch_size, thread="blockIdx.x"):
-            for nv in T.thread_binding(_linear_num_value_heads, "blockIdx.y"):  
+            for nv in T.thread_binding(_linear_num_value_heads, thread="blockIdx.y"):
                 for i in T.serial(seq_len):
                     g_elem = g_T[b, nv, i]
                     b_elem = beta_T[b, nv, i]
-                    
-                    # Step 1: Decay recurrent state by g_elem
-                    # last_recurrent_state = last_recurrent_state * g_t
+
+                    # Step 1: Decay recurrent state by exp(g_elem)
+                    # last_recurrent_state = last_recurrent_state * g_t.exp()
                     for kd in T.serial(_linear_key_head_dim):
                         for vd in T.serial(_linear_value_head_dim):
-                            recurrent_state[b, nv, kd, vd] *= g_elem
-                    
+                            recurrent_state_out_buf[b, nv, kd, vd] *= T.exp(g_elem)
+
                     # Step 2: Compute kv_mem = (state * k_t).sum(dim=-2) for each vd
                     # kv_mem[vd] = sum_over_kd(state[kd, vd] * k[kd])
                     for vd in T.serial(_linear_value_head_dim):
@@ -1154,8 +1189,10 @@ def _recurrent_gated_delta_rule(
                         kv_mem[b, nv, vd] = T.float32(0.0)
                         # Reduction over k_head_dim
                         for k_idx in T.serial(_linear_key_head_dim):
-                            kv_mem[b, nv, vd] += recurrent_state[b, nv, k_idx, vd] * key_T[b, nv, i, k_idx]
-                    
+                            kv_mem[b, nv, vd] += (
+                                recurrent_state_out_buf[b, nv, k_idx, vd] * key_T[b, nv, i, k_idx]
+                            )
+
                     # Step 3: Update state and compute output
                     for kd in T.serial(_linear_key_head_dim):
                         k_elem = key_T[b, nv, i, kd]
@@ -1164,34 +1201,19 @@ def _recurrent_gated_delta_rule(
                             # delta = (v_t - kv_mem) * beta_t
                             delta = (v_elem - kv_mem[b, nv, vd]) * b_elem
                             # Update state: state += k_t * delta
-                            recurrent_state[b, nv, kd, vd] += k_elem * delta
+                            recurrent_state_out_buf[b, nv, kd, vd] += k_elem * delta
 
-        # Stage 3 - Compute output using T.grid + sblock pattern (like chunk_gated_delta_rule)
-        # Output computation: for each position, output[i] = (state * q_t[i]).sum(dim=-2)
-        for b, nv, i, vd, kd in T.grid(
-            batch_size, _linear_num_value_heads, seq_len, _linear_value_head_dim, _linear_key_head_dim
-        ):
-            with T.sblock("compute_output"):
-                vb, vnv, vi, vvd, vkd = T.axis.remap("SSSSR", [b, nv, i, vd, kd])
-                with T.init():
-                    output_T[vb, vnv, vi, vvd] = T.float32(0.0)
-                output_T[vb, vnv, vi, vvd] += recurrent_state[vb, vnv, vkd, vvd] * query_T[vb, vnv, vi, vkd]
-        
-        # Transpose output back to (batch, seq, heads, dim)
-        for b, s, nv, vd in T.grid(batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim):
-            with T.sblock("transpose_output"):
-                vb, vs, vnv, vvd = T.axis.remap("SSSS", [b, s, nv, vd])
-                T.reads(output_T[vb, vnv, vs, vvd])
-                T.writes(core_attn_out_buf[vb, vs, vnv, vvd])
-                core_attn_out_buf[vb, vs, vnv, vvd] = output_T[vb, vnv, vs, vvd]
-        
-        # Copy final recurrent state to output
-        for b, nv, kd, vd in T.grid(batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim):
-            with T.sblock("copy_final_state"):
-                vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b, nv, kd, vd])
-                T.reads(recurrent_state[vb, vnv, vkd, vvd])
-                T.writes(recurrent_state_out_buf[vb, vnv, vkd, vvd])
-                recurrent_state_out_buf[vb, vnv, vkd, vvd] = recurrent_state[vb, vnv, vkd, vvd]
+                    # core_attn_out[:, :, i]=(last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+                    for vd in T.serial(_linear_value_head_dim):
+                        # initialize this position
+                        core_attn_out_buf[b, i, nv, vd] = T.float32(0.0)
+                        # reduction over the key_head dim
+                        for k_idx in T.serial(_linear_key_head_dim):
+                            core_attn_out_buf[b, i, nv, vd] += (
+                                recurrent_state_out_buf[b, nv, k_idx, vd] * query_T[b, nv, i, k_idx]
+                            )
+
+        # recurrent_state_out_buf already contains the final state - no copy needed
 
     if use_qk_l2norm_in_kernel:
         raise NotImplementedError(
