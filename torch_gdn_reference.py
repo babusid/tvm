@@ -173,3 +173,78 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     
     return core_attn_out, last_recurrent_state
+
+
+def torch_recurrent_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Recurrent Gated DeltaNet Forward Pass (Token-by-Token).
+    
+    Args:
+        query: Query tensor of shape (batch_size, seq_len, linear_num_value_heads, linear_key_head_dim)
+        key: Key tensor of shape (batch_size, seq_len, linear_num_value_heads, linear_key_head_dim)
+        value: Value tensor of shape (batch_size, seq_len, linear_num_value_heads, linear_value_head_dim)
+        g: Gate/decay tensor of shape (batch_size, seq_len, linear_num_value_heads)
+        beta: Scalar/beta tensor of shape (batch_size, seq_len, linear_num_value_heads)
+        initial_state: Initial recurrent state
+                      Shape: (batch_size, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim)
+        output_final_state: Whether to return the final recurrent state
+        use_qk_l2norm_in_kernel: Whether to L2-normalize query/key internally
+    
+    Returns:
+        attn_output: Output of shape (batch_size, seq_len, linear_num_value_heads, linear_value_head_dim)
+        final_state: Updated recurrent state or None
+    """
+    initial_dtype = query.dtype
+    
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    
+    # Transpose from (batch, seq, heads, dim) to (batch, heads, seq, dim)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) 
+        for x in (query, key, value, beta, g)
+    ]
+    
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+    
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
+    
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    
+    for i in range(sequence_length):
+        q_t = query[:, :, i]
+        k_t = key[:, :, i]
+        v_t = value[:, :, i]
+        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, i].unsqueeze(-1)
+        
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+    
+    if not output_final_state:
+        last_recurrent_state = None
+    
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    
+    return core_attn_out, last_recurrent_state

@@ -18,10 +18,18 @@ import tvm
 # nd will be assigned from tvm.runtime.ndarray or similar based on TVM version
 
 # Import TVM kernel builders
-from gdn_kernel_dev import build_causal_conv1d_update, build_chunk_gated_delta_rule
+from gdn_kernel_dev import (
+    build_causal_conv1d_update, 
+    build_chunk_gated_delta_rule,
+    build_recurrent_gated_delta_rule  # TODO: implement this in gdn_kernel_dev.py
+)
 
 # Import PyTorch reference implementations
-from torch_gdn_reference import torch_causal_conv1d_update, torch_chunk_gated_delta_rule
+from torch_gdn_reference import (
+    torch_causal_conv1d_update, 
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule
+)
 
 
 def allclose_with_report(actual, expected, rtol=1e-4, atol=1e-4, name="output"):
@@ -315,6 +323,141 @@ def test_chunk_gated_delta_rule(
     return passed
 
 
+def test_recurrent_gated_delta_rule(
+    batch_size=2,
+    seq_len=10,
+    num_v_heads=32,
+    v_head_dim=128,
+    num_k_heads=16,
+    k_head_dim=128,
+    device="cuda",
+    dtype=torch.float32,
+    rtol=1e-4,
+    atol=1e-4,
+    seed=42,
+):
+    """
+    Test recurrent_gated_delta_rule kernel against PyTorch reference (decode path).
+    
+    Args:
+        batch_size: Batch size
+        seq_len: Sequence length (can be any value, processed token-by-token)
+        num_v_heads: Number of value heads
+        v_head_dim: Value head dimension
+        num_k_heads: Number of key heads
+        k_head_dim: Key head dimension
+        device: Device to run on
+        dtype: Data type
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+        seed: Random seed
+    
+    Returns:
+        bool: True if test passes
+    """
+    print(f"\n{'=' * 70}")
+    print(f"Testing recurrent_gated_delta_rule (DECODE PATH)")
+    print(f"  batch_size={batch_size}, seq_len={seq_len}")
+    print(f"  num_v_heads={num_v_heads}, v_head_dim={v_head_dim}")
+    print(f"  num_k_heads={num_k_heads}, k_head_dim={k_head_dim}")
+    print(f"  dtype={dtype}, rtol={rtol}, atol={atol}")
+    print(f"{'=' * 70}")
+
+    # Generate random inputs
+    torch.manual_seed(seed)
+    query = torch.randn(batch_size, seq_len, num_v_heads, k_head_dim, dtype=dtype, device=device)
+    key = torch.randn(batch_size, seq_len, num_v_heads, k_head_dim, dtype=dtype, device=device)
+    value = torch.randn(batch_size, seq_len, num_v_heads, v_head_dim, dtype=dtype, device=device)
+
+    # g should be negative (decay parameter)
+    g = -torch.rand(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 5.0 - 0.1
+
+    # beta should be in (0, 1) (gating parameter)
+    beta = torch.sigmoid(torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device))
+
+    # PyTorch reference
+    print("\nRunning PyTorch reference...")
+    torch_out, torch_state = torch_recurrent_gated_delta_rule(
+        query.clone(),
+        key.clone(),
+        value.clone(),
+        g.clone(),
+        beta.clone(),
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    # Build TVM kernel
+    print("\nBuilding TVM kernel...")
+    tvm_kernel, _ = build_recurrent_gated_delta_rule(
+        linear_num_value_heads=num_v_heads,
+        linear_value_head_dim=v_head_dim,
+        linear_num_key_heads=num_k_heads,
+        linear_key_head_dim=k_head_dim,
+        target="cuda",
+        dtype="float32" if dtype == torch.float32 else "float16",
+    )
+
+    # Prepare TVM inputs
+    print("Running TVM kernel...")
+    ctx = tvm.cuda(0)
+
+    # Create output buffers (use torch.empty to match production behavior)
+    tvm_core_attn_out = tvm.runtime.empty(
+        (batch_size, seq_len, num_v_heads, v_head_dim), dtype="float32", device=ctx
+    )
+    tvm_state_out = tvm.runtime.empty(
+        (batch_size, num_v_heads, k_head_dim, v_head_dim), dtype="float32", device=ctx
+    )
+
+    # Convert PyTorch tensors to TVM
+    tvm_query = tvm.runtime.from_dlpack(query.clone())
+    tvm_key = tvm.runtime.from_dlpack(key.clone())
+    tvm_value = tvm.runtime.from_dlpack(value.clone())
+    tvm_g = tvm.runtime.from_dlpack(g.clone())
+    tvm_beta = tvm.runtime.from_dlpack(beta.clone())
+
+    # Initial state (zeros)
+    initial_state = torch.zeros(
+        batch_size, num_v_heads, k_head_dim, v_head_dim, dtype=dtype, device=device
+    )
+    tvm_initial_state = tvm.runtime.from_dlpack(initial_state.clone())
+
+    # Run kernel
+    tvm_kernel(
+        tvm_query,
+        tvm_key,
+        tvm_value,
+        tvm_g,
+        tvm_beta,
+        tvm_initial_state,
+        tvm_core_attn_out,
+        tvm_state_out,
+    )
+
+    # Convert back to numpy for comparison
+    tvm_out_np = tvm_core_attn_out.numpy()
+    torch_out_np = torch_out.cpu().numpy()
+
+    # Check results
+    print("\nComparing results...")
+    passed = allclose_with_report(
+        tvm_out_np, torch_out_np, rtol=rtol, atol=atol, name="core_attn_out"
+    )
+
+    if passed:
+        print(f"\n{'✓' * 35}")
+        print("TEST PASSED")
+        print(f"{'✓' * 35}")
+    else:
+        print(f"\n{'✗' * 35}")
+        print("TEST FAILED")
+        print(f"{'✗' * 35}")
+
+    return passed
+
+
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -323,7 +466,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--func",
-        choices=["causal_conv1d_update", "chunk_gated_delta_rule"],
+        choices=["causal_conv1d_update", "chunk_gated_delta_rule", "recurrent_gated_delta_rule"],
         help="Filter tests by function name",
     )
     parser.add_argument(
@@ -533,6 +676,68 @@ if __name__ == "__main__":
                 "atol": 5e-3,
             },
         ),
+        # ========== RECURRENT (DECODE PATH) TESTS ==========
+        # Recurrent tests use shorter sequences typical for decode
+        # Single token decode (most common production case)
+        "recurrent_gated_delta_rule_b1_s1": (
+            test_recurrent_gated_delta_rule,
+            5,
+            {
+                "batch_size": 1,
+                "seq_len": 1,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "rtol": 1e-4,
+                "atol": 1e-4,
+            },
+        ),
+        # Small batch decode
+        "recurrent_gated_delta_rule_b2_s8": (
+            test_recurrent_gated_delta_rule,
+            5,
+            {
+                "batch_size": 2,
+                "seq_len": 8,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "rtol": 1e-4,
+                "atol": 1e-4,
+            },
+        ),
+        # Non-power-of-2 batch
+        "recurrent_gated_delta_rule_b3_s16": (
+            test_recurrent_gated_delta_rule,
+            5,
+            {
+                "batch_size": 3,
+                "seq_len": 16,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "rtol": 1e-4,
+                "atol": 1e-4,
+            },
+        ),
+        # Larger batch decode
+        "recurrent_gated_delta_rule_b8_s32": (
+            test_recurrent_gated_delta_rule,
+            5,
+            {
+                "batch_size": 8,
+                "seq_len": 32,
+                "num_v_heads": 32,
+                "v_head_dim": 128,
+                "num_k_heads": 16,
+                "k_head_dim": 128,
+                "rtol": 1e-4,
+                "atol": 1e-4,
+            },
+        ),
     }
 
     results = {}
@@ -552,6 +757,23 @@ if __name__ == "__main__":
                         "hidden_size": 128,
                         "seq_len": min(args.seq_len, 16),  # Cap seq_len for conv1d
                         "state_len": 3,
+                        "rtol": 1e-4,
+                        "atol": 1e-4,
+                    },
+                )
+            }
+        elif args.func == "recurrent_gated_delta_rule":
+            test_configs_to_run = {
+                f"recurrent_gated_delta_rule_custom_b{args.batch_size}_s{args.seq_len}": (
+                    test_recurrent_gated_delta_rule,
+                    num_iterations,
+                    {
+                        "batch_size": args.batch_size,
+                        "seq_len": args.seq_len,
+                        "num_v_heads": 32,
+                        "v_head_dim": 128,
+                        "num_k_heads": 16,
+                        "k_head_dim": 128,
                         "rtol": 1e-4,
                         "atol": 1e-4,
                     },

@@ -955,10 +955,198 @@ def _chunk_gated_delta_rule(
         return chunk_gated_delta_rule
 
 
-def _chunk_recurrent_gated_delta_rule():
-    inputs = []
-    outputs = []
-    return te.create_prim_func(inputs + outputs)
+def _recurrent_gated_delta_rule(
+    linear_num_value_heads: int,
+    linear_value_head_dim: int,
+    linear_num_key_heads: int,
+    linear_key_head_dim: int,
+    use_qk_l2norm_in_kernel: bool = False,
+    dtype: str = "float32",
+):
+    """
+    Generate TIR primfunc for recurrent gated delta rule (decode path).
+    
+    NOTE: L2 normalization is NOT implemented in this kernel.
+    Users must normalize query/key tensors before calling this kernel.
+    The use_qk_l2norm_in_kernel flag is kept for API compatibility but will
+    raise NotImplementedError if set to True.
+    
+    TODO: Implement L2 normalization inside kernel if needed for performance.
+    
+    Args:
+        linear_num_value_heads: Number of value heads
+        linear_value_head_dim: Dimension of value heads
+        linear_num_key_heads: Number of key heads
+        linear_key_head_dim: Dimension of key heads
+        use_qk_l2norm_in_kernel: Whether to apply L2 normalization to Q/K (NOT IMPLEMENTED)
+        dtype: Data type
+    """
+    
+    # Capture compile-time constants
+    _linear_num_value_heads = linear_num_value_heads
+    _linear_value_head_dim = linear_value_head_dim
+    _linear_num_key_heads = linear_num_key_heads
+    _linear_key_head_dim = linear_key_head_dim
+    _dtype = dtype
+    _scale = 1.0 / math.sqrt(_linear_key_head_dim)
+    
+    @T.prim_func
+    def recurrent_gated_delta_rule(
+        query: T.handle,
+        key: T.handle,
+        value: T.handle,
+        g: T.handle,
+        beta: T.handle,
+        initial_state: T.handle,
+        core_attn_out: T.handle,
+        recurrent_state_out: T.handle,
+    ):
+        T.func_attr({"tir.noalias": True})
+        
+        # Dynamic symbolic variables
+        batch_size = T.int64()
+        seq_len = T.int64()
+        
+        # Output buffers
+        recurrent_state_out_buf = T.match_buffer(
+            recurrent_state_out,
+            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        core_attn_out_buf = T.match_buffer(
+            core_attn_out,
+            (batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        
+        # Input buffers
+        query_buf = T.match_buffer(
+            query,
+            (batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim),
+            dtype=_dtype,
+        )
+        key_buf = T.match_buffer(
+            key,
+            (batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim),
+            dtype=_dtype,
+        )
+        value_buf = T.match_buffer(
+            value,
+            (batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        g_buf = T.match_buffer(
+            g, (batch_size, seq_len, _linear_num_value_heads), dtype=_dtype
+        )
+        beta_buf = T.match_buffer(
+            beta, (batch_size, seq_len, _linear_num_value_heads), dtype=_dtype
+        )
+        initial_state_buf = T.match_buffer(
+            initial_state,
+            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        
+        # Intermediate buffers 
+        query_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len, _linear_key_head_dim),
+            dtype=_dtype,
+        )
+        key_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len, _linear_key_head_dim),
+            dtype=_dtype,
+        )
+        value_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        g_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len), dtype=_dtype
+        )
+        beta_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len), dtype=_dtype
+        )
+        recurrent_state = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        output_T = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, seq_len, _linear_value_head_dim),
+            dtype=_dtype,
+        )
+        kv_mem = T.alloc_buffer(
+            (batch_size, _linear_num_value_heads, _linear_key_head_dim),
+            dtype=_dtype,
+        )
+        
+        for b, nv, kd, vd in T.grid(
+            batch_size, _linear_num_value_heads, _linear_key_head_dim, _linear_value_head_dim
+        ):
+            with T.sblock("init_recurrent_state"):
+                vb, vnv, vkd, vvd = T.axis.remap("SSSS", [b, nv, kd, vd])
+                recurrent_state[vb, vnv, vkd, vvd] = initial_state_buf[vb, vnv, vkd, vvd]
+                recurrent_state_out_buf[vb, vnv, vkd, vvd] = initial_state_buf[vb, vnv, vkd, vvd]
+        
+        # Zero-initialize output buffer
+        for b, s, nv, vd in T.grid(
+            batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim
+        ):
+            with T.sblock("init_output"):
+                vb, vs, vnv, vvd = T.axis.remap("SSSS", [b, s, nv, vd])
+                core_attn_out_buf[vb, vs, vnv, vvd] = T.float32(0.0)
+        
+        # Stage 1: Transpose inputs to (batch, heads, seq, dim) and scale query
+        # Transpose and scale query/key
+        for b, s, nv, kd in T.grid(
+            batch_size, seq_len, _linear_num_value_heads, _linear_key_head_dim
+        ):
+            with T.sblock("transpose_qk_scale_q"):
+                vb, vs, vnv, vkd = T.axis.remap("SSSS", [b, s, nv, kd])
+                T.reads(query_buf[vb, vs, vnv, vkd], key_buf[vb, vs, vnv, vkd])
+                T.writes(query_T[vb, vnv, vs, vkd], key_T[vb, vnv, vs, vkd])
+                # inline scaling of query while doing the transpose
+                query_T[vb, vnv, vs, vkd] = query_buf[vb, vs, vnv, vkd] * _scale
+                key_T[vb, vnv, vs, vkd] = key_buf[vb, vs, vnv, vkd]
+        
+        # Transpose value
+        for b, s, nv, vd in T.grid(
+            batch_size, seq_len, _linear_num_value_heads, _linear_value_head_dim
+        ):
+            with T.sblock("transpose_v"):
+                vb, vs, vnv, vvd = T.axis.remap("SSSS", [b, s, nv, vd])
+                T.reads(value_buf[vb, vs, vnv, vvd])
+                T.writes(value_T[vb, vnv, vs, vvd])
+                value_T[vb, vnv, vs, vvd] = value_buf[vb, vs, vnv, vvd]
+        
+        # Transpose g and beta
+        for b, s, nv in T.grid(batch_size, seq_len, _linear_num_value_heads):
+            with T.sblock("transpose_gb"):
+                vb, vs, vnv = T.axis.remap("SSS", [b, s, nv])
+                T.reads(g_buf[vb, vs, vnv], beta_buf[vb, vs, vnv])
+                T.writes(g_T[vb, vnv, vs], beta_T[vb, vnv, vs])
+                g_T[vb, vnv, vs] = g_buf[vb, vs, vnv]
+                beta_T[vb, vnv, vs] = beta_buf[vb, vs, vnv]
+        
+        # TODO: Stage 2 - Main recurrent loop
+        # For each position i in seq_len:
+        #   a. Compute kv_mem = (state * k_t).sum(dim=-1)
+        #   b. Update state: state = state * g_t + k_t * (v_t - kv_mem) * beta_t
+        #   c. Compute output: (state * q_t).sum(dim=-2)
+        for b, nv in T.grid(
+            batch_size, _linear_num_value_heads
+        ):
+            with T.sblock("recurrent_attn_block"):
+                vb, vnv = T.axis.remap()
+        
+        # TODO: Stage 3 - Transpose output back and copy final state
+    
+    if use_qk_l2norm_in_kernel:
+        raise NotImplementedError(
+            "L2 normalization inside kernel is not implemented. "
+            "Please normalize query/key tensors before calling this kernel."
+        )
+    
+    return recurrent_gated_delta_rule
 
 
 # ============================================================================
@@ -1166,6 +1354,58 @@ def build_chunk_gated_delta_rule(
     return built, mod
 
 
+def build_recurrent_gated_delta_rule(
+    linear_num_value_heads: int,
+    linear_value_head_dim: int,
+    linear_num_key_heads: int,
+    linear_key_head_dim: int,
+    target: str = "cuda",
+    dtype: str = "float32",
+):
+    """
+    Build and return a compiled TVM runtime module for recurrent_gated_delta_rule.
+    
+    Uses dlight auto-scheduler for simple initialization-only kernel.
+    
+    Args:
+        linear_num_value_heads: Number of value heads
+        linear_value_head_dim: Dimension of value heads
+        linear_num_key_heads: Number of key heads
+        linear_key_head_dim: Dimension of key heads
+        target: Target platform
+        dtype: Data type
+    
+    Returns:
+        Compiled TVM runtime module
+    """
+    from tvm.s_tir import dlight as dl
+    
+    func = _recurrent_gated_delta_rule(
+        linear_num_value_heads=linear_num_value_heads,
+        linear_value_head_dim=linear_value_head_dim,
+        linear_num_key_heads=linear_num_key_heads,
+        linear_key_head_dim=linear_key_head_dim,
+        use_qk_l2norm_in_kernel=False,
+        dtype=dtype,
+    )
+    
+    if func is None:
+        raise NotImplementedError("L2 norm variant not yet implemented")
+    
+    mod = tvm.IRModule({"recurrent_gated_delta": func})
+    target_obj = tvm.target.Target(target)
+    
+    # Use dlight auto-scheduler for simple initialization kernel
+    with target_obj:
+        mod = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(mod)
+    
+    # Disable storage rewrite to prevent buffer aliasing
+    with tvm.transform.PassContext(config={"tir.disable_storage_rewrite": True}):
+        built = tir.build(mod, target=target_obj)
+    
+    return built, mod
+
+
 # ============================================================================
 # Development/testing code (run with: python gdn_kernel_dev.py)
 # ============================================================================
@@ -1216,3 +1456,25 @@ if __name__ == "__main__":
         print("...\n")
     except Exception as e:
         print(f"✗ chunk_gated_delta_rule failed: {e}\n")
+
+    # Build recurrent gated delta rule
+    print("Building recurrent_gated_delta_rule...")
+    try:
+        recurrent_kernel, mod = build_recurrent_gated_delta_rule(
+            linear_num_value_heads=32,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+        )
+        print("✓ recurrent_gated_delta_rule built successfully\n")
+        print("=== Generated TIR Source ===")
+        mod.show()
+
+        # Print generated CUDA source for inspection
+        print("=== Generated CUDA source ===")
+        cuda_src = recurrent_kernel.imports[0].inspect_source()
+        print(cuda_src)
+        print("...\n")
+    except Exception as e:
+        print(f"✗ recurrent_gated_delta_rule failed: {e}\n")
+
